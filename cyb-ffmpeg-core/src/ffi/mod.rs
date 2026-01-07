@@ -325,6 +325,31 @@ pub extern "C" fn cyb_decoder_seek(handle: *mut CybDecoderHandle, time_us: i64) 
     result
 }
 
+/// Prime audio decoder after seek.
+/// Call this after seek and before reading audio frames to ensure
+/// audio packets are pre-loaded into the queue for immediate decoding.
+/// Returns the number of audio packets queued, or 0 if no audio.
+#[no_mangle]
+pub extern "C" fn cyb_decoder_prime_audio_after_seek(handle: *mut CybDecoderHandle) -> u32 {
+    log::info!("FFI::cyb_decoder_prime_audio_after_seek");
+    if handle.is_null() {
+        log::warn!("FFI::cyb_decoder_prime_audio_after_seek - handle is null");
+        return 0;
+    }
+    let handle = unsafe { &*handle };
+    match handle.decoder.lock().prime_audio_after_seek() {
+        Ok(count) => {
+            log::info!("FFI::cyb_decoder_prime_audio_after_seek - done, queued {} packets", count);
+            count
+        }
+        Err(e) => {
+            log::error!("FFI::cyb_decoder_prime_audio_after_seek - error: {:?}", e);
+            set_last_error(&e.to_string());
+            0
+        }
+    }
+}
+
 /// Get current time
 #[no_mangle]
 pub extern "C" fn cyb_decoder_get_current_time(handle: *const CybDecoderHandle) -> i64 {
