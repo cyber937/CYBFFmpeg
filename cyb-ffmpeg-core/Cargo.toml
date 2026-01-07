@@ -1,0 +1,61 @@
+[package]
+name = "cyb-ffmpeg-core"
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-2.1-or-later"
+authors = ["Cyberseeds"]
+description = "FFmpeg-based video decoding core for CYBFFmpeg"
+repository = "https://github.com/cyberseeds/CYBFFmpeg"
+readme = "README.md"
+
+[lib]
+name = "cyb_ffmpeg_core"
+# Use staticlib only to avoid dylib loading issues at runtime
+crate-type = ["staticlib"]
+
+[features]
+default = ["videotoolbox"]
+videotoolbox = []
+
+[dependencies]
+# FFmpeg bindings - version 8.0 for FFmpeg 7.x/8.x compatibility
+ffmpeg-next = { version = "8.0", default-features = false, features = [
+    "codec",
+    "format",
+    "software-scaling",
+] }
+
+# Concurrency
+crossbeam = "0.8"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+
+# Error handling
+thiserror = "1.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+[build-dependencies]
+cbindgen = "0.26"
+pkg-config = "0.3"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+# Benchmarks disabled until implemented
+# criterion = "0.5"
+# [[bench]]
+# name = "decode_bench"
+# harness = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+debug = true
