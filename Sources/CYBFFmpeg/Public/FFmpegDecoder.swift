@@ -251,6 +251,20 @@ public final class FFmpegDecoder: @unchecked Sendable {
         return try bridge.seek(to: time)
     }
 
+    /// Prime audio decoder after seek.
+    /// Call this after seek() and before getNextAudioFrame() to ensure
+    /// audio packets are pre-loaded into the queue for immediate decoding.
+    /// This is necessary because after seek, the first packets read from the
+    /// stream may be video packets, leaving the audio queue empty.
+    /// Returns the number of audio packets that were queued.
+    @discardableResult
+    public func primeAudioAfterSeek() -> Int {
+        guard !isInvalidated, isPrepared, let bridge = bridge else {
+            return 0
+        }
+        return bridge.primeAudioAfterSeek()
+    }
+
     // MARK: - Prefetch (Scrubbing)
 
     /// Start prefetching frames for scrubbing

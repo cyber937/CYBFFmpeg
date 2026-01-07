@@ -497,6 +497,19 @@ impl FFmpegContext {
             log::info!("FFmpegContext::seek - flushing audio decoder");
             decoder.flush();
         }
+
+        // Flush the resampler to clear any buffered samples from before the seek.
+        // This is critical for MPEG audio (MP2/MP3) which uses overlapping synthesis windows.
+        if let Some(ref mut resampler) = self.resampler {
+            log::info!("FFmpegContext::seek - flushing audio resampler");
+            // Create a temporary output frame to receive any remaining samples (discard them)
+            let target_format = ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed);
+            let target_layout = ffmpeg::channel_layout::ChannelLayout::STEREO;
+            let mut flush_output = ffmpeg::frame::Audio::new(target_format, 4096, target_layout);
+            // Flush may fail if no samples buffered, ignore the error
+            let _ = resampler.flush(&mut flush_output);
+        }
+
         self.audio_packet_queue.clear();
         self.video_packet_queue.clear();
 
@@ -506,6 +519,67 @@ impl FFmpegContext {
 
         log::info!("FFmpegContext::seek - complete");
         Ok(())
+    }
+
+    /// Prime the audio decoder after seek by pre-reading packets into queues.
+    /// This ensures that audio packets are available for decode_next_audio_frame() after seek.
+    /// The function reads from the input stream and queues both audio and video packets
+    /// so that subsequent calls to decode_next_audio_frame() or decode_next_frame()
+    /// can process them without hitting empty queues due to interleaved packet ordering.
+    /// Returns the number of audio packets that were queued.
+    pub fn prime_audio_after_seek(&mut self) -> Result<u32> {
+        if self.audio_decoder.is_none() {
+            log::debug!("prime_audio_after_seek - no audio decoder");
+            return Ok(0);
+        }
+
+        let audio_stream_idx = match self.audio_stream_index {
+            Some(idx) => idx,
+            None => {
+                log::debug!("prime_audio_after_seek - no audio stream");
+                return Ok(0);
+            }
+        };
+
+        log::info!("prime_audio_after_seek - starting, audio_queue={}, video_queue={}",
+            self.audio_packet_queue.len(), self.video_packet_queue.len());
+
+        let max_packets = 200; // Limit packet reads to avoid reading too far
+        let target_audio_packets = 10; // Target number of audio packets to queue
+        let mut packet_count = 0;
+        let mut audio_packets_queued = 0;
+        let mut video_packets_queued = 0;
+
+        // Read packets until we have enough audio packets queued
+        while packet_count < max_packets && audio_packets_queued < target_audio_packets {
+            match self.input.packets().next() {
+                Some((stream, packet)) => {
+                    packet_count += 1;
+                    if stream.index() == audio_stream_idx {
+                        // Queue audio packet for later decoding
+                        log::trace!("prime_audio_after_seek - queueing audio packet {}", audio_packets_queued + 1);
+                        self.audio_packet_queue.push_back(packet);
+                        audio_packets_queued += 1;
+                    } else if Some(stream.index()) == self.video_stream_index {
+                        // Queue video packets for later video decoding
+                        log::trace!("prime_audio_after_seek - queueing video packet");
+                        self.video_packet_queue.push_back(packet);
+                        video_packets_queued += 1;
+                    }
+                    // Skip other streams (subtitles, etc.)
+                }
+                None => {
+                    log::info!("prime_audio_after_seek - end of stream reached");
+                    break;
+                }
+            }
+        }
+
+        log::info!("prime_audio_after_seek - done: read {} packets, queued {} audio + {} video, audio_queue={}, video_queue={}",
+            packet_count, audio_packets_queued, video_packets_queued,
+            self.audio_packet_queue.len(), self.video_packet_queue.len());
+
+        Ok(audio_packets_queued)
     }
 
     /// Decode the next frame
@@ -904,10 +978,21 @@ impl FFmpegContext {
                 log::debug!("decode_next_audio_frame - sending audio packet {} to decoder", packet_count);
                 // Send packet to decoder
                 if let Some(ref mut decoder) = self.audio_decoder {
-                    decoder.send_packet(&packet).map_err(|e| {
-                        log::error!("decode_next_audio_frame - send_packet failed: {}", e);
-                        Error::DecodeFailed(format!("Failed to send audio packet: {}", e))
-                    })?;
+                    match decoder.send_packet(&packet) {
+                        Ok(()) => {
+                            // Packet sent successfully
+                        }
+                        Err(e) => {
+                            // After seek, MP2/MP3 decoder may fail on first few packets
+                            // because they don't start at a valid frame boundary (sync header).
+                            // Skip invalid packets and continue to the next one.
+                            log::warn!(
+                                "decode_next_audio_frame - send_packet failed (skipping): {}",
+                                e
+                            );
+                            continue;
+                        }
+                    }
                 }
 
                 // Try to receive a frame
