@@ -1,0 +1,5 @@
+module CybFFmpegC {
+    header "include/cyb_ffmpeg.h"
+    link "cyb_ffmpeg_core"
+    export *
+}
