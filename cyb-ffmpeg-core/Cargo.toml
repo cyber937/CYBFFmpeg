@@ -23,6 +23,7 @@ ffmpeg-next = { version = "8.0", default-features = false, features = [
     "codec",
     "format",
     "software-scaling",
+    "software-resampling",
 ] }
 
 # Concurrency

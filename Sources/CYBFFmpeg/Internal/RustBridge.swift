@@ -215,6 +215,41 @@ internal final class RustBridge: @unchecked Sendable {
         }
     }
 
+    // MARK: - Audio
+
+    /// Check if decoder has audio
+    func hasAudio() -> Bool {
+        guard let handle = handle else { return false }
+        return cyb_decoder_has_audio(handle)
+    }
+
+    /// Get audio sample rate
+    func audioSampleRate() -> Int {
+        guard let handle = handle else { return 0 }
+        return Int(cyb_decoder_get_audio_sample_rate(handle))
+    }
+
+    /// Get audio channel count
+    func audioChannels() -> Int {
+        guard let handle = handle else { return 0 }
+        return Int(cyb_decoder_get_audio_channels(handle))
+    }
+
+    /// Get next audio frame
+    func getNextAudioFrame() -> FFmpegAudioFrame? {
+        guard let handle = handle else { return nil }
+
+        var frameHandle: OpaquePointer?
+        let result = cyb_decoder_get_next_audio_frame(handle, &frameHandle)
+
+        guard result == CYB_RESULT_SUCCESS, let frameHandle = frameHandle else {
+            return nil
+        }
+
+        defer { cyb_audio_frame_release(frameHandle) }
+        return Self.convertAudioFrame(frameHandle)
+    }
+
     // MARK: - Private Helpers
 
     private func withHandle<T>(_ body: (OpaquePointer) throws -> T) throws -> T {
@@ -365,6 +400,29 @@ internal final class RustBridge: @unchecked Sendable {
             isKeyframe: cybFrame.is_keyframe,
             width: Int(cybFrame.width),
             height: Int(cybFrame.height),
+            frameNumber: cybFrame.frame_number
+        )
+    }
+
+    private static func convertAudioFrame(_ frameHandle: OpaquePointer) -> FFmpegAudioFrame {
+        var cybFrame = CybAudioFrame()
+        cyb_audio_frame_get_data(frameHandle, &cybFrame)
+
+        // Copy audio samples from FFI pointer
+        let totalSamples = Int(cybFrame.sample_count) * Int(cybFrame.channels)
+        var samples: [Float] = []
+
+        if let dataPtr = cybFrame.data, totalSamples > 0 {
+            samples = Array(UnsafeBufferPointer(start: dataPtr, count: totalSamples))
+        }
+
+        return FFmpegAudioFrame(
+            samples: samples,
+            sampleCount: Int(cybFrame.sample_count),
+            channels: Int(cybFrame.channels),
+            sampleRate: Int(cybFrame.sample_rate),
+            presentationTime: Double(cybFrame.pts_us) / 1_000_000.0,
+            duration: Double(cybFrame.duration_us) / 1_000_000.0,
             frameNumber: cybFrame.frame_number
         )
     }

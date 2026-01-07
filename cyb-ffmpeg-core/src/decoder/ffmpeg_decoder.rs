@@ -2,17 +2,20 @@
 //!
 //! This module provides the actual FFmpeg integration via ffmpeg-next bindings.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
 use ffmpeg_next as ffmpeg;
 use ffmpeg_next::codec::context::Context as CodecContext;
 use ffmpeg_next::format::context::Input as FormatContext;
 use ffmpeg_next::media::Type as MediaType;
+use ffmpeg_next::software::resampling::Context as ResamplerContext;
 use ffmpeg_next::software::scaling::{Context as ScalerContext, Flags as ScalerFlags};
+use ffmpeg_next::util::frame::audio::Audio as AudioFrameFFmpeg;
 use ffmpeg_next::util::frame::video::Video as VideoFrameFFmpeg;
 use ffmpeg_next::Rational;
 
+use super::audio_frame::AudioFrame;
 use super::config::{DecoderConfig, PixelFormat};
 use super::frame::VideoFrame;
 use super::info::{AudioTrack, CodecInfo, MediaInfo, VideoTrack};
@@ -32,17 +35,35 @@ pub struct FFmpegContext {
     /// Video decoder
     video_decoder: Option<ffmpeg::decoder::Video>,
 
+    /// Audio decoder
+    audio_decoder: Option<ffmpeg::decoder::Audio>,
+
     /// Scaler for pixel format conversion
     scaler: Option<ScalerContext>,
+
+    /// Resampler for audio format conversion
+    resampler: Option<ResamplerContext>,
 
     /// Target pixel format
     target_format: PixelFormat,
 
+    /// Target audio sample rate (default: 48000 Hz)
+    target_sample_rate: u32,
+
+    /// Target audio channels (default: 2 = stereo)
+    target_channels: u32,
+
     /// Frame counter
     frame_number: i64,
 
+    /// Audio frame counter
+    audio_frame_number: i64,
+
     /// Time base for video stream
     video_time_base: Rational,
+
+    /// Time base for audio stream
+    audio_time_base: Rational,
 
     /// Video duration in microseconds
     duration_us: i64,
@@ -56,8 +77,20 @@ pub struct FFmpegContext {
     /// Video height
     height: u32,
 
+    /// Audio sample rate (source)
+    audio_sample_rate: u32,
+
+    /// Audio channels (source)
+    audio_channels: u32,
+
     /// Prefer hardware decoding
     prefer_hw: bool,
+
+    /// Queue of audio packets collected during video decoding
+    audio_packet_queue: VecDeque<ffmpeg::Packet>,
+
+    /// Queue of video packets collected during audio decoding
+    video_packet_queue: VecDeque<ffmpeg::Packet>,
 }
 
 impl FFmpegContext {
@@ -99,20 +132,35 @@ impl FFmpegContext {
             video_stream_index,
             audio_stream_index,
             video_decoder: None,
+            audio_decoder: None,
             scaler: None,
+            resampler: None,
             target_format: config.output_pixel_format,
+            target_sample_rate: 48000, // Standard audio sample rate
+            target_channels: 2,        // Stereo
             frame_number: 0,
+            audio_frame_number: 0,
             video_time_base: Rational::new(1, 1000000),
+            audio_time_base: Rational::new(1, 1000000),
             duration_us: 0,
             frame_rate: 0.0,
             width: 0,
             height: 0,
+            audio_sample_rate: 0,
+            audio_channels: 0,
             prefer_hw: config.prefer_hardware_decoding,
+            audio_packet_queue: VecDeque::with_capacity(64),
+            video_packet_queue: VecDeque::with_capacity(32),
         };
 
         // Initialize video decoder if we have a video stream
         if let Some(stream_idx) = ctx.video_stream_index {
             ctx.init_video_decoder(stream_idx, config)?;
+        }
+
+        // Initialize audio decoder if we have an audio stream
+        if let Some(stream_idx) = ctx.audio_stream_index {
+            ctx.init_audio_decoder(stream_idx)?;
         }
 
         Ok(ctx)
@@ -211,6 +259,101 @@ impl FFmpegContext {
         }
 
         self.video_decoder = Some(video_decoder);
+        Ok(())
+    }
+
+    /// Initialize audio decoder for a stream
+    fn init_audio_decoder(&mut self, stream_index: usize) -> Result<()> {
+        let stream = self.input.stream(stream_index).ok_or_else(|| {
+            Error::InvalidFormat(format!("Audio stream {} not found", stream_index))
+        })?;
+
+        // Get codec parameters
+        let codec_params = stream.parameters();
+        self.audio_time_base = stream.time_base();
+
+        // Find decoder
+        let decoder_codec = ffmpeg::decoder::find(codec_params.id()).ok_or_else(|| {
+            Error::CodecNotSupported(format!("No decoder for audio codec: {:?}", codec_params.id()))
+        })?;
+
+        log::info!(
+            "Using audio decoder: {} ({})",
+            decoder_codec.name(),
+            decoder_codec.description()
+        );
+
+        // Create decoder context
+        let mut decoder_ctx = CodecContext::new_with_codec(decoder_codec);
+        decoder_ctx.set_parameters(codec_params).map_err(|e| {
+            Error::DecodeFailed(format!("Failed to set audio codec parameters: {}", e))
+        })?;
+
+        // Open decoder
+        let audio_decoder = decoder_ctx.decoder().audio().map_err(|e| {
+            Error::DecodeFailed(format!("Failed to open audio decoder: {}", e))
+        })?;
+
+        self.audio_sample_rate = audio_decoder.rate();
+        self.audio_channels = audio_decoder.channels() as u32;
+
+        log::info!(
+            "Audio: {} Hz, {} channels, format: {:?}",
+            self.audio_sample_rate,
+            self.audio_channels,
+            audio_decoder.format()
+        );
+
+        // Create resampler to convert to float32 stereo at target sample rate
+        let source_format = audio_decoder.format();
+        let source_rate = audio_decoder.rate();
+        let source_channels = audio_decoder.channels() as u32;
+
+        // Get channel layout - if empty, create one from channel count
+        let source_layout = {
+            let layout = audio_decoder.channel_layout();
+            if layout.is_empty() {
+                // Create layout from channel count
+                match source_channels {
+                    1 => ffmpeg::channel_layout::ChannelLayout::MONO,
+                    2 => ffmpeg::channel_layout::ChannelLayout::STEREO,
+                    _ => {
+                        log::warn!("Unsupported channel count: {}, defaulting to stereo", source_channels);
+                        ffmpeg::channel_layout::ChannelLayout::STEREO
+                    }
+                }
+            } else {
+                layout
+            }
+        };
+
+        // Target: stereo, float32, 48kHz
+        let target_layout = ffmpeg::channel_layout::ChannelLayout::STEREO;
+        let target_format = ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed);
+
+        // Create resampler
+        let resampler = ResamplerContext::get(
+            source_format,
+            source_layout,
+            source_rate,
+            target_format,
+            target_layout,
+            self.target_sample_rate,
+        )
+        .map_err(|e| Error::DecodeFailed(format!("Failed to create audio resampler: {}", e)))?;
+
+        log::info!(
+            "Audio resampler: {:?} {:?} {}Hz -> {:?} {:?} {}Hz",
+            source_format,
+            source_layout,
+            source_rate,
+            target_format,
+            target_layout,
+            self.target_sample_rate
+        );
+
+        self.resampler = Some(resampler);
+        self.audio_decoder = Some(audio_decoder);
         Ok(())
     }
 
@@ -345,12 +488,21 @@ impl FFmpegContext {
 
         // Flush decoder buffers - critical after seek!
         if let Some(ref mut decoder) = self.video_decoder {
-            log::info!("FFmpegContext::seek - flushing decoder");
+            log::info!("FFmpegContext::seek - flushing video decoder");
             decoder.flush();
         }
 
-        // Reset frame counter for accurate tracking after seek
+        // Flush audio decoder and clear packet queues
+        if let Some(ref mut decoder) = self.audio_decoder {
+            log::info!("FFmpegContext::seek - flushing audio decoder");
+            decoder.flush();
+        }
+        self.audio_packet_queue.clear();
+        self.video_packet_queue.clear();
+
+        // Reset frame counters for accurate tracking after seek
         self.frame_number = 0;
+        self.audio_frame_number = 0;
 
         log::info!("FFmpegContext::seek - complete");
         Ok(())
@@ -382,27 +534,39 @@ impl FFmpegContext {
                 return Ok(None);
             }
 
-            log::trace!("decode_next_frame - reading packet {}", packet_count);
+            log::trace!("decode_next_frame - reading packet {}, video_queue={}", packet_count, self.video_packet_queue.len());
 
-            // Read packets until we get a video packet
-            let packet = match self.input.packets().next() {
-                Some((stream, packet)) => {
-                    packet_count += 1;
-                    if stream.index() == video_stream_idx {
-                        log::trace!("decode_next_frame - got video packet {}", packet_count);
-                        Some(packet)
-                    } else {
-                        log::trace!("decode_next_frame - skipping non-video packet (stream {})", stream.index());
-                        continue; // Skip non-video packets
+            // First, try to get video packets from the queue (collected during audio decoding)
+            let packet = if let Some(queued_packet) = self.video_packet_queue.pop_front() {
+                log::trace!("decode_next_frame - using queued video packet, remaining={}", self.video_packet_queue.len());
+                packet_count += 1;
+                Some(queued_packet)
+            } else {
+                // Queue is empty, read from stream
+                match self.input.packets().next() {
+                    Some((stream, packet)) => {
+                        packet_count += 1;
+                        if stream.index() == video_stream_idx {
+                            log::trace!("decode_next_frame - got video packet {}", packet_count);
+                            Some(packet)
+                        } else if Some(stream.index()) == self.audio_stream_index {
+                            // Queue audio packets for later decoding
+                            log::trace!("decode_next_frame - queueing audio packet (stream {})", stream.index());
+                            self.audio_packet_queue.push_back(packet);
+                            continue;
+                        } else {
+                            log::trace!("decode_next_frame - skipping other packet (stream {})", stream.index());
+                            continue; // Skip other streams (subtitles, etc.)
+                        }
                     }
-                }
-                None => {
-                    log::info!("decode_next_frame - end of stream, flushing decoder");
-                    // End of stream - flush decoder
-                    if let Some(ref mut decoder) = self.video_decoder {
-                        decoder.send_eof().ok();
+                    None => {
+                        log::info!("decode_next_frame - end of stream, flushing decoder");
+                        // End of stream - flush decoder
+                        if let Some(ref mut decoder) = self.video_decoder {
+                            decoder.send_eof().ok();
+                        }
+                        return self.receive_frame();
                     }
-                    return self.receive_frame();
                 }
             };
 
@@ -649,6 +813,351 @@ impl FFmpegContext {
     pub fn duration_us(&self) -> i64 {
         self.duration_us
     }
+
+    /// Get audio sample rate (returns target/output sample rate after resampling)
+    pub fn audio_sample_rate(&self) -> u32 {
+        // Return target sample rate since we resample to this rate
+        if self.resampler.is_some() {
+            self.target_sample_rate
+        } else {
+            self.audio_sample_rate
+        }
+    }
+
+    /// Get audio channels (returns target/output channel count after resampling)
+    pub fn audio_channels(&self) -> u32 {
+        // Return target channels since we resample to stereo
+        if self.resampler.is_some() {
+            self.target_channels
+        } else {
+            self.audio_channels
+        }
+    }
+
+    /// Check if audio is available
+    pub fn has_audio(&self) -> bool {
+        self.audio_decoder.is_some()
+    }
+
+    /// Decode the next audio frame
+    pub fn decode_next_audio_frame(&mut self) -> Result<Option<AudioFrame>> {
+        log::debug!("decode_next_audio_frame - start, queue_size={}", self.audio_packet_queue.len());
+
+        let audio_stream_idx = match self.audio_stream_index {
+            Some(idx) => {
+                log::debug!("decode_next_audio_frame - audio stream index={}", idx);
+                idx
+            }
+            None => {
+                log::warn!("decode_next_audio_frame - no audio stream index");
+                return Ok(None);
+            }
+        };
+
+        if self.audio_decoder.is_none() {
+            log::warn!("decode_next_audio_frame - no audio decoder");
+            return Ok(None);
+        }
+
+        let max_packets = 500;
+        let mut packet_count = 0;
+
+        loop {
+            if packet_count >= max_packets {
+                log::warn!("decode_next_audio_frame - exceeded max packet count");
+                return Ok(None);
+            }
+
+            // First, try to get audio packets from the queue (collected during video decoding)
+            let packet = if let Some(queued_packet) = self.audio_packet_queue.pop_front() {
+                log::trace!("decode_next_audio_frame - using queued packet, remaining={}", self.audio_packet_queue.len());
+                packet_count += 1;
+                Some(queued_packet)
+            } else {
+                // Queue is empty, read from stream
+                match self.input.packets().next() {
+                    Some((stream, packet)) => {
+                        packet_count += 1;
+                        if stream.index() == audio_stream_idx {
+                            Some(packet)
+                        } else if Some(stream.index()) == self.video_stream_index {
+                            // Queue video packets for later decoding
+                            log::trace!("decode_next_audio_frame - queueing video packet (stream {})", stream.index());
+                            self.video_packet_queue.push_back(packet);
+                            continue;
+                        } else {
+                            // Skip other streams (subtitles, etc.)
+                            continue;
+                        }
+                    }
+                    None => {
+                        // End of stream - flush decoder
+                        if let Some(ref mut decoder) = self.audio_decoder {
+                            decoder.send_eof().ok();
+                        }
+                        return self.receive_audio_frame();
+                    }
+                }
+            };
+
+            if let Some(packet) = packet {
+                log::debug!("decode_next_audio_frame - sending audio packet {} to decoder", packet_count);
+                // Send packet to decoder
+                if let Some(ref mut decoder) = self.audio_decoder {
+                    decoder.send_packet(&packet).map_err(|e| {
+                        log::error!("decode_next_audio_frame - send_packet failed: {}", e);
+                        Error::DecodeFailed(format!("Failed to send audio packet: {}", e))
+                    })?;
+                }
+
+                // Try to receive a frame
+                if let Some(frame) = self.receive_audio_frame()? {
+                    log::debug!("decode_next_audio_frame - returning frame with {} samples", frame.sample_count);
+                    return Ok(Some(frame));
+                }
+            }
+        }
+    }
+
+    /// Receive a decoded audio frame from the decoder
+    fn receive_audio_frame(&mut self) -> Result<Option<AudioFrame>> {
+        let decoder = match self.audio_decoder.as_mut() {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let mut decoded = AudioFrameFFmpeg::empty();
+
+        match decoder.receive_frame(&mut decoded) {
+            Ok(()) => {
+                // Get timestamp
+                let pts = decoded.pts().unwrap_or(0);
+                let pts_us = Self::pts_to_us(pts, self.audio_time_base);
+
+                log::debug!(
+                    "receive_audio_frame - decoded: pts={}, samples={}, rate={}, channels={}, format={:?}",
+                    pts,
+                    decoded.samples(),
+                    decoded.rate(),
+                    decoded.channels(),
+                    decoded.format()
+                );
+
+                // Convert to float32 stereo using resampler
+                let frame = self.convert_audio_frame(&decoded, pts_us)?;
+                self.audio_frame_number += 1;
+
+                if frame.sample_count > 0 {
+                    log::debug!(
+                        "receive_audio_frame - output: samples={}, channels={}, data_len={}",
+                        frame.sample_count,
+                        frame.channels,
+                        frame.data.len()
+                    );
+                }
+
+                Ok(Some(frame))
+            }
+            Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::error::EAGAIN => {
+                // Need more data
+                log::trace!("receive_audio_frame - EAGAIN, need more data");
+                Ok(None)
+            }
+            Err(ffmpeg::Error::Eof) => {
+                // End of stream
+                log::debug!("receive_audio_frame - EOF");
+                Ok(None)
+            }
+            Err(e) => Err(Error::DecodeFailed(format!("Failed to receive audio frame: {}", e))),
+        }
+    }
+
+    /// Convert FFmpeg audio frame to our AudioFrame format
+    fn convert_audio_frame(&mut self, frame: &AudioFrameFFmpeg, pts_us: i64) -> Result<AudioFrame> {
+        let resampler = match self.resampler.as_mut() {
+            Some(r) => r,
+            None => {
+                return Err(Error::DecodeFailed("No audio resampler available".to_string()));
+            }
+        };
+
+        // Pre-allocate output frame with target format
+        // Calculate expected output samples based on sample rate conversion
+        let input_samples = frame.samples();
+        let input_rate = frame.rate() as u64;
+        let output_rate = self.target_sample_rate as u64;
+
+        // Calculate output samples (with some extra buffer for rounding)
+        let expected_output_samples = if input_rate > 0 {
+            ((input_samples as u64 * output_rate + input_rate - 1) / input_rate) as usize + 32
+        } else {
+            input_samples + 32
+        };
+
+        let target_format = ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed);
+        let target_layout = ffmpeg::channel_layout::ChannelLayout::STEREO;
+
+        // Create and allocate output frame
+        let mut resampled = ffmpeg::frame::Audio::new(target_format, expected_output_samples, target_layout);
+
+        // Set the sample rate on output frame
+        unsafe {
+            (*resampled.as_mut_ptr()).sample_rate = self.target_sample_rate as i32;
+        }
+
+        // Fix input frame channel layout if empty (some decoders don't set it)
+        // The resampler needs matching channel layout to what it was initialized with
+        let frame_layout = frame.channel_layout();
+        let input_frame = if frame_layout.is_empty() {
+            // Clone the frame and set the channel layout
+            let mut fixed_frame = unsafe {
+                let mut new_frame = ffmpeg::frame::Audio::empty();
+                // Copy frame data via FFI
+                ffmpeg::ffi::av_frame_ref(new_frame.as_mut_ptr(), frame.as_ptr());
+                new_frame
+            };
+
+            // Set channel layout based on channel count
+            let layout = match frame.channels() {
+                1 => ffmpeg::channel_layout::ChannelLayout::MONO,
+                2 => ffmpeg::channel_layout::ChannelLayout::STEREO,
+                _ => ffmpeg::channel_layout::ChannelLayout::STEREO,
+            };
+            fixed_frame.set_channel_layout(layout);
+
+            log::debug!(
+                "convert_audio_frame - fixed empty channel layout to {:?}",
+                layout
+            );
+
+            Some(fixed_frame)
+        } else {
+            None
+        };
+
+        // Use the fixed frame if we created one, otherwise use original
+        let input_ref = input_frame.as_ref().unwrap_or(frame);
+
+        log::trace!(
+            "convert_audio_frame - input: samples={}, rate={}, channels={}, format={:?}, layout={:?}",
+            input_ref.samples(),
+            input_ref.rate(),
+            input_ref.channels(),
+            input_ref.format(),
+            input_ref.channel_layout()
+        );
+
+        // Run resampler - use run() which handles the conversion
+        let delay = resampler.run(input_ref, &mut resampled).map_err(|e| {
+            log::error!("Audio resample failed: {}", e);
+            Error::DecodeFailed(format!("Audio resample failed: {}", e))
+        })?;
+
+        // Get actual output sample count
+        let actual_samples = resampled.samples();
+
+        log::trace!(
+            "convert_audio_frame - output: samples={}, delay={:?}",
+            actual_samples,
+            delay
+        );
+
+        if actual_samples == 0 {
+            // Resampler may need more input data before producing output
+            log::trace!("convert_audio_frame - no output samples yet (buffering)");
+
+            // Return empty frame - caller should continue feeding input
+            return Ok(AudioFrame::new(
+                Vec::new(),
+                0,
+                self.target_channels,
+                self.target_sample_rate,
+                pts_us,
+                0,
+                self.audio_frame_number,
+            ));
+        }
+
+        // Extract float32 samples from resampled frame
+        let output_samples = Self::extract_float_samples_static(&resampled);
+
+        let sample_count = if self.target_channels > 0 {
+            output_samples.len() / self.target_channels as usize
+        } else {
+            0
+        };
+
+        log::trace!(
+            "convert_audio_frame - extracted {} float samples ({} frames)",
+            output_samples.len(),
+            sample_count
+        );
+
+        let duration_us = AudioFrame::calculate_duration_us(
+            sample_count as u32,
+            self.target_sample_rate,
+        );
+
+        Ok(AudioFrame::new(
+            output_samples,
+            sample_count as u32,
+            self.target_channels,
+            self.target_sample_rate,
+            pts_us,
+            duration_us,
+            self.audio_frame_number,
+        ))
+    }
+
+    /// Extract float32 samples from an FFmpeg audio frame (static version)
+    fn extract_float_samples_static(frame: &ffmpeg::frame::Audio) -> Vec<f32> {
+        let samples = frame.samples();
+        let channels = frame.channels() as usize;
+
+        if samples == 0 || channels == 0 {
+            return Vec::new();
+        }
+
+        let total_samples = samples * channels;
+        let mut output = Vec::with_capacity(total_samples);
+
+        // Get data from plane 0 (packed format)
+        let data = frame.data(0);
+        let float_slice = unsafe {
+            std::slice::from_raw_parts(
+                data.as_ptr() as *const f32,
+                total_samples.min(data.len() / 4),
+            )
+        };
+
+        output.extend_from_slice(float_slice);
+        output
+    }
+
+    /// Seek audio stream
+    pub fn seek_audio(&mut self, time_us: i64) -> Result<()> {
+        log::debug!("seek_audio - seeking to {} us", time_us);
+
+        // Seek using container-level seek (affects all streams)
+        self.input
+            .seek(time_us, ..time_us)
+            .map_err(|e| Error::SeekFailed(time_us))?;
+
+        // Flush audio decoder
+        if let Some(ref mut decoder) = self.audio_decoder {
+            decoder.flush();
+        }
+
+        self.audio_frame_number = 0;
+        Ok(())
+    }
+
+    /// Flush audio decoder buffers
+    pub fn flush_audio(&mut self) {
+        if let Some(ref mut decoder) = self.audio_decoder {
+            decoder.flush();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -678,5 +1187,83 @@ mod tests {
             FFmpegContext::pixel_format_to_ffmpeg(PixelFormat::Nv12),
             ffmpeg::format::Pixel::NV12
         );
+    }
+
+    /// Test audio decoding with sample WMV file
+    #[test]
+    fn test_audio_decoding_wmv() {
+        // Initialize logging for test
+        let _ = env_logger::builder()
+            .filter_level(log::LevelFilter::Debug)
+            .is_test(true)
+            .try_init();
+
+        let sample_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("samples/sample_960x400_ocean_with_audio.wmv");
+
+        if !sample_path.exists() {
+            eprintln!("Skipping test: sample file not found at {:?}", sample_path);
+            return;
+        }
+
+        let config = DecoderConfig::default();
+        let mut ctx = FFmpegContext::new(&sample_path, &config)
+            .expect("Failed to create FFmpegContext");
+
+        // Verify audio stream exists
+        assert!(ctx.audio_stream_index.is_some(), "No audio stream found");
+        assert!(ctx.audio_decoder.is_some(), "No audio decoder initialized");
+        assert!(ctx.resampler.is_some(), "No resampler initialized");
+
+        println!("Audio stream index: {:?}", ctx.audio_stream_index);
+        println!("Source sample rate: {}", ctx.audio_sample_rate);
+        println!("Source channels: {}", ctx.audio_channels);
+        println!("Target sample rate: {}", ctx.target_sample_rate);
+        println!("Target channels: {}", ctx.target_channels);
+
+        // Try to decode audio frames
+        let mut frame_count = 0;
+        let mut total_samples = 0;
+        let max_frames = 10;
+
+        for _ in 0..max_frames {
+            match ctx.decode_next_audio_frame() {
+                Ok(Some(frame)) => {
+                    println!(
+                        "Audio frame {}: samples={}, channels={}, rate={}, data_len={}",
+                        frame_count,
+                        frame.sample_count,
+                        frame.channels,
+                        frame.sample_rate,
+                        frame.data.len()
+                    );
+
+                    assert!(frame.sample_count > 0, "Frame should have samples");
+                    assert_eq!(frame.channels, ctx.target_channels, "Channels mismatch");
+                    assert_eq!(frame.sample_rate, ctx.target_sample_rate, "Sample rate mismatch");
+                    assert_eq!(
+                        frame.data.len(),
+                        (frame.sample_count * frame.channels) as usize,
+                        "Data length mismatch"
+                    );
+
+                    frame_count += 1;
+                    total_samples += frame.sample_count as usize;
+                }
+                Ok(None) => {
+                    println!("No more audio frames");
+                    break;
+                }
+                Err(e) => {
+                    panic!("Error decoding audio frame: {:?}", e);
+                }
+            }
+        }
+
+        println!("Decoded {} audio frames with {} total samples", frame_count, total_samples);
+        assert!(frame_count > 0, "Should have decoded at least one audio frame");
+        assert!(total_samples > 0, "Should have decoded some audio samples");
     }
 }
