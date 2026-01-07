@@ -27,6 +27,9 @@ typedef enum CybResult {
     CYB_RESULT_ERROR_UNKNOWN = 99,
 } CybResult;
 
+// Opaque audio frame handle (owns the data)
+typedef struct CybAudioFrameHandle CybAudioFrameHandle;
+
 // Opaque decoder handle
 typedef struct CybDecoderHandle CybDecoderHandle;
 
@@ -114,6 +117,24 @@ typedef struct CybAudioTrack {
     int32_t channels;
     int64_t bit_rate;
 } CybAudioTrack;
+
+// Audio frame data for FFI
+typedef struct CybAudioFrame {
+    // Raw sample data pointer (interleaved float32)
+    const float *data;
+    // Number of samples per channel
+    uint32_t sample_count;
+    // Number of audio channels
+    uint32_t channels;
+    // Sample rate in Hz
+    uint32_t sample_rate;
+    // Presentation timestamp in microseconds
+    int64_t pts_us;
+    // Duration in microseconds
+    int64_t duration_us;
+    // Sequential frame number
+    int64_t frame_number;
+} CybAudioFrame;
 
 // Get last error message
  const char *cyb_get_last_error(void) ;
@@ -234,5 +255,29 @@ enum CybResult cyb_media_info_get_audio_track(const struct CybMediaInfoHandle *i
 
 // Check if decoding is active
  bool cyb_decoder_is_decoding(const struct CybDecoderHandle *handle) ;
+
+// Get next audio frame in sequence
+
+enum CybResult cyb_decoder_get_next_audio_frame(struct CybDecoderHandle *handle,
+                                                struct CybAudioFrameHandle **out_frame)
+;
+
+// Get audio frame data from handle
+
+void cyb_audio_frame_get_data(const struct CybAudioFrameHandle *frame_handle,
+                              struct CybAudioFrame *out_frame)
+;
+
+// Release audio frame handle
+ void cyb_audio_frame_release(struct CybAudioFrameHandle *frame_handle) ;
+
+// Check if decoder has audio
+ bool cyb_decoder_has_audio(const struct CybDecoderHandle *handle) ;
+
+// Get audio sample rate
+ uint32_t cyb_decoder_get_audio_sample_rate(const struct CybDecoderHandle *handle) ;
+
+// Get audio channel count
+ uint32_t cyb_decoder_get_audio_channels(const struct CybDecoderHandle *handle) ;
 
 #endif /* CYB_FFMPEG_H */

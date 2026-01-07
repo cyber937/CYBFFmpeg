@@ -162,4 +162,57 @@ final class CYBFFmpegTests: XCTestCase {
         XCTAssertEqual(PixelFormat(rawValue: 2), .yuv420p)
         XCTAssertEqual(PixelFormat(rawValue: 99), .bgra)  // Unknown defaults to bgra
     }
+
+    // MARK: - Audio Decoding Tests
+
+    func testAudioDecodingWMV() async throws {
+        // Path to the sample WMV file (absolute path for reliability)
+        let samplePath = URL(fileURLWithPath: "/Users/kiyoshi/Developments/Cyberseeds/CYBMediaPlayerProject/CYBFFmpeg/samples/sample_960x400_ocean_with_audio.wmv")
+
+        guard FileManager.default.fileExists(atPath: samplePath.path) else {
+            print("Skipping test: sample file not found at \(samplePath.path)")
+            return
+        }
+
+        // Create decoder
+        let decoder = try FFmpegDecoder(url: samplePath)
+        try await decoder.prepare()
+
+        // Verify audio is available
+        XCTAssertTrue(decoder.hasAudio, "WMV file should have audio")
+        XCTAssertGreaterThan(decoder.audioSampleRate, 0, "Sample rate should be positive")
+        XCTAssertGreaterThan(decoder.audioChannels, 0, "Channel count should be positive")
+
+        print("Audio info: \(decoder.audioSampleRate)Hz, \(decoder.audioChannels) channels")
+
+        // Start decoding
+        decoder.startDecoding()
+
+        // Try to decode a few audio frames
+        var frameCount = 0
+        var totalSamples = 0
+
+        for _ in 0..<10 {
+            if let frame = decoder.getNextAudioFrame() {
+                XCTAssertGreaterThan(frame.sampleCount, 0, "Frame should have samples")
+                XCTAssertEqual(frame.channels, decoder.audioChannels, "Channel count should match")
+                XCTAssertEqual(frame.sampleRate, decoder.audioSampleRate, "Sample rate should match")
+                XCTAssertEqual(frame.samples.count, frame.sampleCount * frame.channels, "Sample array size should match")
+
+                frameCount += 1
+                totalSamples += frame.sampleCount
+
+                print("Frame \(frameCount): \(frame.sampleCount) samples, pts=\(frame.presentationTime)s")
+            }
+        }
+
+        XCTAssertGreaterThan(frameCount, 0, "Should have decoded at least one audio frame")
+        XCTAssertGreaterThan(totalSamples, 0, "Should have decoded some audio samples")
+
+        print("Decoded \(frameCount) frames with \(totalSamples) total samples")
+
+        // Cleanup
+        decoder.stopDecoding()
+        decoder.invalidate()
+    }
 }
