@@ -182,6 +182,12 @@ void cyb_decoder_get_cache_stats(const struct CybDecoderHandle *handle,
 // Seek
  enum CybResult cyb_decoder_seek(struct CybDecoderHandle *handle, int64_t time_us) ;
 
+// Prime audio decoder after seek.
+// Call this after seek and before reading audio frames to ensure
+// audio packets are pre-loaded into the queue for immediate decoding.
+// Returns the number of audio packets queued, or 0 if no audio.
+ uint32_t cyb_decoder_prime_audio_after_seek(struct CybDecoderHandle *handle) ;
+
 // Get current time
  int64_t cyb_decoder_get_current_time(const struct CybDecoderHandle *handle) ;
 

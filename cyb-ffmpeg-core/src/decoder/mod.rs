@@ -182,6 +182,33 @@ impl Decoder {
         Ok(())
     }
 
+    /// Prime the audio decoder after seek.
+    /// Call this after seek() and before get_next_audio_frame() to ensure
+    /// audio packets are pre-loaded into the queue for immediate decoding.
+    /// This is necessary because after seek, the first packets read from the
+    /// stream may be video packets, leaving the audio queue empty.
+    /// Returns the number of audio packets that were queued.
+    pub fn prime_audio_after_seek(&self) -> Result<u32> {
+        if !self.is_prepared() {
+            log::warn!("Decoder::prime_audio_after_seek - not prepared");
+            return Err(Error::NotPrepared);
+        }
+
+        log::info!("Decoder::prime_audio_after_seek - acquiring lock");
+
+        let mut ctx_lock = self.ffmpeg_ctx.lock();
+
+        if let Some(ref mut ctx) = *ctx_lock {
+            log::info!("Decoder::prime_audio_after_seek - calling FFmpegContext::prime_audio_after_seek");
+            let count = ctx.prime_audio_after_seek()?;
+            log::info!("Decoder::prime_audio_after_seek - done, queued {} audio packets", count);
+            Ok(count)
+        } else {
+            log::warn!("Decoder::prime_audio_after_seek - no FFmpeg context");
+            Ok(0)
+        }
+    }
+
     /// Get frame at specific time
     pub fn get_frame_at(&self, time_us: i64, tolerance_us: i64) -> Result<Option<VideoFrame>> {
         if !self.is_prepared() {

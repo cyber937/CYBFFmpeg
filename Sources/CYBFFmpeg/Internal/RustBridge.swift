@@ -250,6 +250,17 @@ internal final class RustBridge: @unchecked Sendable {
         return Self.convertAudioFrame(frameHandle)
     }
 
+    /// Prime audio decoder after seek.
+    /// Call this after seek() and before getNextAudioFrame() to ensure
+    /// audio packets are pre-loaded into the queue for immediate decoding.
+    /// This is necessary because after seek, the first packets read from the
+    /// stream may be video packets, leaving the audio queue empty.
+    /// Returns the number of audio packets that were queued.
+    func primeAudioAfterSeek() -> Int {
+        guard let handle = handle else { return 0 }
+        return Int(cyb_decoder_prime_audio_after_seek(handle))
+    }
+
     // MARK: - Private Helpers
 
     private func withHandle<T>(_ body: (OpaquePointer) throws -> T) throws -> T {
