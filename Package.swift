@@ -45,6 +45,7 @@ let package = Package(
                 .linkedLibrary("avformat"),
                 .linkedLibrary("avutil"),
                 .linkedLibrary("swscale"),
+                .linkedLibrary("swresample"),
             ]
         ),
         .systemLibrary(

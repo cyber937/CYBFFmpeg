@@ -11,11 +11,13 @@ use parking_lot::{Mutex, RwLock};
 use crate::cache::{Cache, CacheConfig};
 use crate::error::{Error, Result};
 
+mod audio_frame;
 mod config;
 mod ffmpeg_decoder;
 mod frame;
 mod info;
 
+pub use audio_frame::{AudioFrame, SampleFormat};
 pub use config::{DecoderConfig, PixelFormat};
 pub use frame::VideoFrame;
 pub use info::{AudioTrack, CodecInfo, MediaInfo, VideoTrack};
@@ -302,6 +304,52 @@ impl Decoder {
         }
 
         Ok(None)
+    }
+
+    /// Get next audio frame in sequence
+    pub fn get_next_audio_frame(&self) -> Result<Option<AudioFrame>> {
+        if !self.is_prepared() {
+            return Err(Error::NotPrepared);
+        }
+
+        if !self.is_decoding() {
+            return Ok(None);
+        }
+
+        let mut ctx_lock = self.ffmpeg_ctx.lock();
+        if let Some(ref mut ctx) = *ctx_lock {
+            if let Some(frame) = ctx.decode_next_audio_frame()? {
+                return Ok(Some(frame));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Check if media has audio
+    pub fn has_audio(&self) -> bool {
+        if let Some(ref info) = *self.media_info.read() {
+            return !info.audio_tracks.is_empty();
+        }
+        false
+    }
+
+    /// Get audio sample rate
+    pub fn audio_sample_rate(&self) -> u32 {
+        let ctx_lock = self.ffmpeg_ctx.lock();
+        if let Some(ref ctx) = *ctx_lock {
+            return ctx.audio_sample_rate();
+        }
+        0
+    }
+
+    /// Get audio channels
+    pub fn audio_channels(&self) -> u32 {
+        let ctx_lock = self.ffmpeg_ctx.lock();
+        if let Some(ref ctx) = *ctx_lock {
+            return ctx.audio_channels();
+        }
+        0
     }
 
     /// Start prefetch
