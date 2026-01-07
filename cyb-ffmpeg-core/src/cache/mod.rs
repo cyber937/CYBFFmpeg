@@ -322,7 +322,7 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decoder::config::PixelFormat;
+    use crate::decoder::PixelFormat;
 
     fn test_frame(pts_us: i64) -> VideoFrame {
         VideoFrame::new(
