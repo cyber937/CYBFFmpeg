@@ -310,7 +310,7 @@ pub extern "C" fn cyb_decoder_stop(handle: *mut CybDecoderHandle) -> CybResult {
     CybResult::Success
 }
 
-/// Seek
+/// Seek (keyframe seek - fast but may not be frame-accurate)
 #[no_mangle]
 pub extern "C" fn cyb_decoder_seek(handle: *mut CybDecoderHandle, time_us: i64) -> CybResult {
     log::info!("FFI::cyb_decoder_seek - time_us={}", time_us);
@@ -323,6 +323,54 @@ pub extern "C" fn cyb_decoder_seek(handle: *mut CybDecoderHandle, time_us: i64) 
     let result: CybResult = handle.decoder.lock().seek(time_us).into();
     log::info!("FFI::cyb_decoder_seek - done, result={:?}", result);
     result
+}
+
+/// Seek precisely (frame-accurate seek).
+/// This performs a keyframe seek first, then decodes frames until reaching the target time.
+/// Returns the frame at or just before the target time.
+#[no_mangle]
+pub extern "C" fn cyb_decoder_seek_precise(
+    handle: *mut CybDecoderHandle,
+    time_us: i64,
+    out_frame: *mut *mut CybFrameHandle,
+) -> CybResult {
+    log::info!("FFI::cyb_decoder_seek_precise - time_us={}", time_us);
+    if handle.is_null() || out_frame.is_null() {
+        log::warn!("FFI::cyb_decoder_seek_precise - handle or out_frame is null");
+        return CybResult::ErrorInvalidHandle;
+    }
+
+    let handle = unsafe { &*handle };
+    log::info!("FFI::cyb_decoder_seek_precise - acquiring lock");
+    let decoder = handle.decoder.lock();
+    log::info!("FFI::cyb_decoder_seek_precise - lock acquired, calling seek_precise");
+
+    match decoder.seek_precise(time_us) {
+        Ok(Some(frame)) => {
+            log::info!(
+                "FFI::cyb_decoder_seek_precise - got frame: pts={} us, {}x{}",
+                frame.pts_us,
+                frame.width,
+                frame.height
+            );
+            let frame_handle = Box::new(CybFrameHandle { frame });
+            unsafe {
+                *out_frame = Box::into_raw(frame_handle);
+            }
+            CybResult::Success
+        }
+        Ok(None) => {
+            log::info!("FFI::cyb_decoder_seek_precise - no frame");
+            unsafe {
+                *out_frame = ptr::null_mut();
+            }
+            CybResult::Success
+        }
+        Err(e) => {
+            log::error!("FFI::cyb_decoder_seek_precise - error: {:?}", e);
+            e.into()
+        }
+    }
 }
 
 /// Prime audio decoder after seek.
