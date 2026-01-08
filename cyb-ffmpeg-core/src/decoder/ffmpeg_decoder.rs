@@ -177,13 +177,77 @@ impl FFmpegContext {
         self.video_time_base = stream.time_base();
 
         // Calculate duration
-        let duration = stream.duration();
-        if duration > 0 {
-            self.duration_us = Self::pts_to_us(duration, self.video_time_base);
-        } else {
-            // Use container duration
-            let container_duration = self.input.duration();
+        // For elementary streams like .m2v, neither stream nor container duration
+        // may be available. Try multiple sources in order of reliability.
+        let stream_duration = stream.duration();
+        let container_duration = self.input.duration();
+
+        // AV_NOPTS_VALUE is 0x8000000000000000 (i64::MIN)
+        // We use a special marker for "needs scan" that's different
+        const NEEDS_SCAN_MARKER: i64 = -999_999_999_999;
+
+        // Helper to get file size
+        let get_file_size = || -> i64 {
+            unsafe {
+                let pb = (*self.input.as_ptr()).pb;
+                if !pb.is_null() {
+                    ffmpeg::ffi::avio_size(pb)
+                } else {
+                    0
+                }
+            }
+        };
+
+        // Check if duration value is valid (not AV_NOPTS_VALUE or other invalid values)
+        // AV_NOPTS_VALUE = 0x8000000000000000 = i64::MIN = -9223372036854775808
+        let is_valid_duration = |d: i64| -> bool {
+            // Valid if positive and not near i64::MIN (AV_NOPTS_VALUE)
+            d > 0 && d < i64::MAX / 2
+        };
+
+        log::debug!("Raw durations - stream: {}, container: {}, AV_NOPTS_VALUE: {}",
+            stream_duration, container_duration, ffmpeg::ffi::AV_NOPTS_VALUE);
+
+        if is_valid_duration(stream_duration) {
+            // Stream duration is most reliable
+            self.duration_us = Self::pts_to_us(stream_duration, self.video_time_base);
+            log::debug!("Duration from stream: {} us", self.duration_us);
+        } else if is_valid_duration(container_duration) {
+            // Container duration as fallback
             self.duration_us = container_duration * 1_000_000 / ffmpeg::ffi::AV_TIME_BASE as i64;
+            log::debug!("Duration from container: {} us", self.duration_us);
+        } else {
+            // For elementary streams (.m2v, .m2a, etc.) with no duration info
+            let bit_rate = unsafe { (*self.input.as_ptr()).bit_rate };
+            let file_size = get_file_size();
+            let nb_frames = stream.frames();
+
+            log::debug!("Duration fallback: bit_rate={}, file_size={}, nb_frames={}",
+                bit_rate, file_size, nb_frames);
+
+            // Check if nb_frames is valid (not 0, not AV_NOPTS_VALUE-like values)
+            // AV_NOPTS_VALUE is i64::MIN, but nb_frames could also be very large invalid values
+            let is_valid_frame_count = |n: i64| -> bool {
+                n > 0 && n < 100_000_000 // Max 100 million frames (~1000 hours at 30fps)
+            };
+
+            if bit_rate > 0 && file_size > 0 {
+                // Estimate from file size and bitrate
+                // duration = file_size * 8 / bit_rate (in seconds)
+                self.duration_us = (file_size * 8 * 1_000_000) / bit_rate;
+                log::info!("Duration estimated from file size ({} bytes) and bitrate ({} bps): {} us",
+                    file_size, bit_rate, self.duration_us);
+            } else if is_valid_frame_count(nb_frames) {
+                // Will calculate duration after frame rate is known
+                log::debug!("Stream has {} frames, will calculate duration after frame rate", nb_frames);
+                // Store frame count temporarily, negative to indicate it's a frame count
+                self.duration_us = -nb_frames;
+            } else {
+                // For elementary streams like .m2v, we need to scan the file to count frames
+                // This is the only reliable way to get duration for these formats
+                log::info!("Elementary stream detected, will scan for duration after decoder init");
+                self.duration_us = NEEDS_SCAN_MARKER;
+            }
         }
 
         // Get frame rate
@@ -192,6 +256,16 @@ impl FFmpegContext {
             self.frame_rate = frame_rate.numerator() as f64 / frame_rate.denominator() as f64;
         } else {
             self.frame_rate = 24.0; // Default
+        }
+
+        // If duration_us is negative (but not the scan marker), it contains frame count
+        if self.duration_us < 0 && self.duration_us != NEEDS_SCAN_MARKER {
+            let nb_frames = -self.duration_us;
+            if self.frame_rate > 0.0 {
+                self.duration_us = ((nb_frames as f64 / self.frame_rate) * 1_000_000.0) as i64;
+                log::info!("Duration calculated from {} frames at {:.2} fps: {} us ({:.2}s)",
+                    nb_frames, self.frame_rate, self.duration_us, self.duration_us as f64 / 1_000_000.0);
+            }
         }
 
         // Find decoder
@@ -219,12 +293,118 @@ impl FFmpegContext {
         }
 
         // Open decoder
-        let video_decoder = decoder_ctx.decoder().video().map_err(|e| {
+        let mut video_decoder = decoder_ctx.decoder().video().map_err(|e| {
             Error::DecodeFailed(format!("Failed to open video decoder: {}", e))
         })?;
 
         self.width = video_decoder.width();
         self.height = video_decoder.height();
+
+        // Check if we need to scan for duration (elementary stream marker)
+        // NEEDS_SCAN_MARKER is defined earlier in this function
+        if self.duration_us == NEEDS_SCAN_MARKER {
+            // Elementary stream - need to scan entire file to count frames
+            // For elementary streams like .m2v, PTS values reset after seek,
+            // so we must count all frames from the beginning
+            log::info!("Scanning elementary stream for duration (counting all frames)...");
+
+            let mut frame_count: i64 = 0;
+            let mut max_pts: i64 = 0;
+            let scan_start = std::time::Instant::now();
+
+            // Count all video packets from the beginning
+            for (stream, packet) in self.input.packets() {
+                if Some(stream.index()) == self.video_stream_index {
+                    frame_count += 1;
+                    // Track max PTS for verification
+                    if let Some(pts) = packet.pts() {
+                        if pts > max_pts {
+                            max_pts = pts;
+                        }
+                    }
+                    if let Some(dts) = packet.dts() {
+                        if dts > max_pts {
+                            max_pts = dts;
+                        }
+                    }
+                }
+            }
+
+            let scan_duration = scan_start.elapsed();
+            log::info!("Scanned {} frames in {:.2}s, max PTS: {}",
+                frame_count, scan_duration.as_secs_f64(), max_pts);
+
+            if frame_count > 0 && self.frame_rate > 0.0 {
+                // Calculate duration from frame count and frame rate
+                self.duration_us = ((frame_count as f64 / self.frame_rate) * 1_000_000.0) as i64;
+                log::info!("Duration from frame count: {} frames / {:.2} fps = {} us ({:.2}s)",
+                    frame_count, self.frame_rate, self.duration_us,
+                    self.duration_us as f64 / 1_000_000.0);
+            } else if max_pts > 0 {
+                // Fallback to PTS-based calculation
+                self.duration_us = Self::pts_to_us(max_pts, self.video_time_base);
+                if self.frame_rate > 0.0 {
+                    self.duration_us += (1_000_000.0 / self.frame_rate) as i64;
+                }
+                log::info!("Duration from max PTS: {} us ({:.2}s)",
+                    self.duration_us, self.duration_us as f64 / 1_000_000.0);
+            } else {
+                // Last resort: estimate from file size
+                let file_size = unsafe {
+                    let pb = (*self.input.as_ptr()).pb;
+                    if !pb.is_null() {
+                        ffmpeg::ffi::avio_size(pb)
+                    } else {
+                        0
+                    }
+                };
+                if file_size > 0 {
+                    // Rough estimate: assume ~6 Mbps for MPEG-2
+                    let estimated_bitrate = 6_000_000i64;
+                    self.duration_us = (file_size * 8 * 1_000_000) / estimated_bitrate;
+                    log::info!("Duration estimated from file size: {:.2}s",
+                        self.duration_us as f64 / 1_000_000.0);
+                } else {
+                    self.duration_us = 10 * 60 * 1_000_000;
+                    log::warn!("Using default duration of 10 minutes for unknown elementary stream");
+                }
+            }
+
+            // Seek back to beginning for playback
+            log::debug!("Seeking back to beginning after duration scan...");
+
+            // For elementary streams, we need to reopen or use avformat_seek_file
+            // Try byte-based seek first
+            let seek_back_result = unsafe {
+                ffmpeg::ffi::avformat_seek_file(
+                    self.input.as_mut_ptr(),
+                    -1,
+                    i64::MIN,
+                    0,
+                    0,
+                    ffmpeg::ffi::AVSEEK_FLAG_BYTE as i32,
+                )
+            };
+
+            if seek_back_result < 0 {
+                log::warn!("avformat_seek_file to beginning failed ({}), trying av_seek_frame", seek_back_result);
+                let _ = unsafe {
+                    ffmpeg::ffi::av_seek_frame(
+                        self.input.as_mut_ptr(),
+                        -1,
+                        0,
+                        ffmpeg::ffi::AVSEEK_FLAG_BYTE as i32,
+                    )
+                };
+            }
+
+            video_decoder.flush();
+            log::debug!("Seek back completed, decoder flushed");
+        } else if self.duration_us < 0 {
+            // Negative duration is an error
+            log::warn!("Duration calculation resulted in negative value {}, setting to 0", self.duration_us);
+            self.duration_us = 0;
+        }
 
         log::info!(
             "Video: {}x{} @ {:.2} fps, duration: {:.2}s",
@@ -464,7 +644,7 @@ impl FFmpegContext {
         })
     }
 
-    /// Seek to a specific time in microseconds
+    /// Seek to a specific time in microseconds (seeks to nearest keyframe)
     pub fn seek(&mut self, time_us: i64) -> Result<()> {
         log::info!(
             "FFmpegContext::seek - time_us={}, time_base={}/{}",
@@ -478,13 +658,82 @@ impl FFmpegContext {
         // to seek to a keyframe at or before the target position
         log::info!("FFmpegContext::seek - calling input.seek() with target={} us", time_us);
 
-        self.input
-            .seek(time_us, ..time_us)
-            .map_err(|e| {
-                log::error!("FFmpegContext::seek - seek failed: {}", e);
-                Error::SeekFailed(time_us)
-            })?;
-        log::info!("FFmpegContext::seek - seek succeeded");
+        // Try timestamp-based seek first
+        let seek_result = self.input.seek(time_us, ..time_us);
+
+        if let Err(e) = seek_result {
+            log::warn!("FFmpegContext::seek - timestamp seek failed: {}, trying byte-based seek", e);
+
+            // For elementary streams (like .m2v), timestamp seek may fail
+            // Fall back to byte-based seek
+            if time_us == 0 {
+                // Seek to beginning - use byte position 0
+                let byte_seek_result = unsafe {
+                    ffmpeg::ffi::av_seek_frame(
+                        self.input.as_mut_ptr(),
+                        -1,
+                        0,
+                        ffmpeg::ffi::AVSEEK_FLAG_BYTE as i32,
+                    )
+                };
+
+                if byte_seek_result < 0 {
+                    // Try avformat_seek_file as last resort
+                    let file_seek_result = unsafe {
+                        ffmpeg::ffi::avformat_seek_file(
+                            self.input.as_mut_ptr(),
+                            -1,
+                            i64::MIN,
+                            0,
+                            0,
+                            ffmpeg::ffi::AVSEEK_FLAG_BYTE as i32,
+                        )
+                    };
+                    if file_seek_result < 0 {
+                        log::error!("FFmpegContext::seek - all seek methods failed");
+                        return Err(Error::SeekFailed(time_us));
+                    }
+                }
+                log::info!("FFmpegContext::seek - byte seek to beginning succeeded");
+            } else {
+                // For non-zero seeks, try to estimate byte position
+                // This is a rough estimate based on file position
+                if self.duration_us > 0 {
+                    let file_size = unsafe {
+                        let pb = (*self.input.as_ptr()).pb;
+                        if !pb.is_null() {
+                            ffmpeg::ffi::avio_size(pb)
+                        } else {
+                            0
+                        }
+                    };
+
+                    if file_size > 0 {
+                        // Estimate byte position proportionally
+                        let byte_pos = (file_size as f64 * (time_us as f64 / self.duration_us as f64)) as i64;
+                        let byte_seek_result = unsafe {
+                            ffmpeg::ffi::av_seek_frame(
+                                self.input.as_mut_ptr(),
+                                -1,
+                                byte_pos,
+                                ffmpeg::ffi::AVSEEK_FLAG_BYTE as i32,
+                            )
+                        };
+                        if byte_seek_result < 0 {
+                            log::error!("FFmpegContext::seek - byte seek to {} failed", byte_pos);
+                            return Err(Error::SeekFailed(time_us));
+                        }
+                        log::info!("FFmpegContext::seek - byte seek to position {} succeeded", byte_pos);
+                    } else {
+                        return Err(Error::SeekFailed(time_us));
+                    }
+                } else {
+                    return Err(Error::SeekFailed(time_us));
+                }
+            }
+        } else {
+            log::info!("FFmpegContext::seek - timestamp seek succeeded");
+        }
 
         // Flush decoder buffers - critical after seek!
         if let Some(ref mut decoder) = self.video_decoder {
@@ -519,6 +768,117 @@ impl FFmpegContext {
 
         log::info!("FFmpegContext::seek - complete");
         Ok(())
+    }
+
+    /// Seek precisely to a specific time in microseconds.
+    /// This performs a keyframe seek first, then decodes frames until reaching the target time.
+    /// Returns the frame at or just before the target time (frame-accurate seek).
+    pub fn seek_precise(&mut self, time_us: i64) -> Result<Option<VideoFrame>> {
+        log::info!(
+            "FFmpegContext::seek_precise - time_us={}, time_base={}/{}",
+            time_us,
+            self.video_time_base.numerator(),
+            self.video_time_base.denominator()
+        );
+
+        // First, seek to keyframe at or before target
+        self.seek(time_us)?;
+
+        // Now decode frames until we reach the target time
+        // We need to find the frame at or just before time_us
+        let mut best_frame: Option<VideoFrame> = None;
+        let max_frames = 300; // Limit to prevent infinite loop (enough for ~10 seconds at 30fps)
+        let mut frame_count = 0;
+
+        log::info!("FFmpegContext::seek_precise - decoding frames to reach target");
+
+        loop {
+            if frame_count >= max_frames {
+                log::warn!(
+                    "FFmpegContext::seek_precise - exceeded max frame count ({}), returning best frame",
+                    max_frames
+                );
+                break;
+            }
+
+            match self.decode_next_frame()? {
+                Some(frame) => {
+                    frame_count += 1;
+                    let frame_pts = frame.pts_us;
+
+                    log::debug!(
+                        "FFmpegContext::seek_precise - decoded frame {}: pts={} us (target: {} us)",
+                        frame_count,
+                        frame_pts,
+                        time_us
+                    );
+
+                    // Check if this frame is at or before the target
+                    if frame_pts <= time_us {
+                        // This frame is a candidate - keep it as best
+                        best_frame = Some(frame);
+
+                        // Check if we're close enough (within one frame duration)
+                        let frame_duration_us = if self.frame_rate > 0.0 {
+                            (1_000_000.0 / self.frame_rate) as i64
+                        } else {
+                            33333 // ~30fps default
+                        };
+
+                        // If the next frame would be past the target, we found our frame
+                        if frame_pts + frame_duration_us > time_us {
+                            log::info!(
+                                "FFmpegContext::seek_precise - found target frame at {} us (target: {} us, delta: {} us)",
+                                frame_pts,
+                                time_us,
+                                time_us - frame_pts
+                            );
+                            break;
+                        }
+                    } else {
+                        // Frame is past the target
+                        if best_frame.is_some() {
+                            // We already have a frame before target, use it
+                            log::info!(
+                                "FFmpegContext::seek_precise - frame {} us is past target {} us, using previous frame",
+                                frame_pts,
+                                time_us
+                            );
+                        } else {
+                            // No frame before target found (target is before first keyframe after seek)
+                            // Return this frame as best effort
+                            log::info!(
+                                "FFmpegContext::seek_precise - no frame before target, using first available at {} us",
+                                frame_pts
+                            );
+                            best_frame = Some(frame);
+                        }
+                        break;
+                    }
+                }
+                None => {
+                    // End of stream
+                    log::info!("FFmpegContext::seek_precise - end of stream reached");
+                    break;
+                }
+            }
+        }
+
+        if let Some(ref frame) = best_frame {
+            log::info!(
+                "FFmpegContext::seek_precise - complete: returning frame at {} us (target: {} us, decoded {} frames)",
+                frame.pts_us,
+                time_us,
+                frame_count
+            );
+        } else {
+            log::warn!(
+                "FFmpegContext::seek_precise - no frame found (decoded {} frames)",
+                frame_count
+            );
+        }
+
+        Ok(best_frame)
     }
 
     /// Prime the audio decoder after seek by pre-reading packets into queues.
