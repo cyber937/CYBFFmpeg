@@ -153,17 +153,34 @@ internal final class RustBridge: @unchecked Sendable {
         return try? Self.convertFrame(frameHandle)
     }
 
-    /// Seek to time
+    /// Seek to time (frame-accurate seek)
+    /// This performs a keyframe seek first, then decodes frames until reaching the target time.
+    /// Returns the frame at or just before the target time.
     func seek(to time: Double) throws -> FFmpegFrame? {
-        // First, perform the seek operation
+        try withHandle { handle in
+            let timeMicros = Int64(time * 1_000_000)
+
+            var frameHandle: OpaquePointer?
+            let result = cyb_decoder_seek_precise(handle, timeMicros, &frameHandle)
+            try Self.checkResult(result)
+
+            guard let frameHandle = frameHandle else {
+                return nil
+            }
+
+            defer { cyb_frame_release(frameHandle) }
+            return try Self.convertFrame(frameHandle)
+        }
+    }
+
+    /// Seek to keyframe (fast but not frame-accurate)
+    /// This only seeks to the nearest keyframe without decoding intermediate frames.
+    func seekToKeyframe(at time: Double) throws {
         try withHandle { handle in
             let timeMicros = Int64(time * 1_000_000)
             let result = cyb_decoder_seek(handle, timeMicros)
             try Self.checkResult(result)
         }
-
-        // Get frame at new position (after releasing the lock)
-        return try getFrame(at: time, tolerance: 0.033)
     }
 
     // MARK: - Prefetch
