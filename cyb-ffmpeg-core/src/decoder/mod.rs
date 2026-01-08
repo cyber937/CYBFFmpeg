@@ -10,10 +10,11 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::cache::{Cache, CacheConfig};
 use crate::error::{Error, Result};
+use crate::threading::{PrefetchContext, PrefetchManager};
 
 mod audio_frame;
-mod config;
-mod ffmpeg_decoder;
+pub(crate) mod config;
+pub(crate) mod ffmpeg_decoder;
 mod frame;
 mod info;
 
@@ -50,11 +51,14 @@ pub struct Decoder {
     /// Whether prefetch is active
     is_prefetching: AtomicBool,
 
-    /// Current playhead position in microseconds
-    current_time_us: AtomicI64,
+    /// Current playhead position in microseconds (shared with prefetch workers)
+    current_time_us: Arc<AtomicI64>,
 
     /// Current frame number
     current_frame: AtomicI64,
+
+    /// Prefetch manager (created on first start_prefetch call)
+    prefetch_manager: Mutex<Option<Arc<PrefetchManager>>>,
 }
 
 impl Decoder {
@@ -83,8 +87,9 @@ impl Decoder {
             is_prepared: AtomicBool::new(false),
             is_decoding: AtomicBool::new(false),
             is_prefetching: AtomicBool::new(false),
-            current_time_us: AtomicI64::new(0),
+            current_time_us: Arc::new(AtomicI64::new(0)),
             current_frame: AtomicI64::new(0),
+            prefetch_manager: Mutex::new(None),
         })
     }
 
@@ -97,10 +102,20 @@ impl Decoder {
         log::info!("Preparing decoder for: {}", self.path);
 
         // Initialize FFmpeg context
-        let ctx = FFmpegContext::new(&self.path, &self.config)?;
+        let mut ctx = FFmpegContext::new(&self.path, &self.config)?;
 
         // Extract media info
         let media_info = ctx.get_media_info()?;
+
+        // Build keyframe index for fast seeking (synchronous during prepare)
+        // Limit to 2000 entries to prevent excessive memory usage on very long videos
+        let keyframe_count = ctx.build_keyframe_index(2000).unwrap_or_else(|e| {
+            log::warn!("Failed to build keyframe index: {:?}", e);
+            0
+        });
+        if keyframe_count > 0 {
+            log::info!("Built keyframe index with {} entries", keyframe_count);
+        }
 
         // Store context and info
         {
@@ -424,26 +439,85 @@ impl Decoder {
     }
 
     /// Start prefetch
+    ///
+    /// Starts background prefetching of frames in the specified direction.
+    /// This creates or reuses a PrefetchManager with 2 worker threads that
+    /// decode frames ahead of the current position for smooth scrubbing.
+    ///
+    /// # Arguments
+    /// * `direction` - Prefetch direction (1 = forward, -1 = backward)
+    /// * `velocity` - Scrub velocity in x speed (1.0 = normal speed)
     pub fn start_prefetch(&self, direction: i32, velocity: f64) -> Result<()> {
         if !self.is_prepared() {
             return Err(Error::NotPrepared);
         }
 
-        log::debug!(
+        // Skip if prefetch is disabled in config
+        if !self.config.enable_prefetch {
+            log::debug!("Prefetch disabled in config, skipping");
+            return Ok(());
+        }
+
+        log::info!(
             "Starting prefetch: direction={}, velocity={}",
             direction,
             velocity
         );
-        self.is_prefetching.store(true, Ordering::Release);
 
-        // TODO: Start prefetch worker threads
-        // For now, just set the flag
+        // Get media info for frame rate and duration
+        let (frame_rate, duration_us) = {
+            let info = self.media_info.read();
+            if let Some(ref info) = *info {
+                let fr = info.primary_video().map(|v| v.frame_rate).unwrap_or(30.0);
+                // Convert duration from seconds to microseconds
+                let dur = (info.duration * 1_000_000.0) as i64;
+                (fr, dur)
+            } else {
+                (30.0, 0)
+            }
+        };
+
+        // Create or get prefetch manager
+        let mut pm_lock = self.prefetch_manager.lock();
+        let manager = if pm_lock.is_none() {
+            // Create new prefetch context
+            let context = PrefetchContext::new(
+                self.path.clone(),
+                self.config.clone(),
+                self.cache.clone(),
+                self.current_time_us.clone(),
+                frame_rate,
+                duration_us,
+            );
+
+            // Create manager with 2 threads (as specified in plan)
+            let manager = PrefetchManager::new_with_context(2, context);
+            *pm_lock = Some(manager.clone());
+            manager
+        } else {
+            pm_lock.as_ref().unwrap().clone()
+        };
+
+        // Start prefetching
+        let current = self.current_time_us.load(Ordering::Acquire);
+        manager.start(direction, velocity, current);
+
+        self.is_prefetching.store(true, Ordering::Release);
         Ok(())
     }
 
     /// Stop prefetch
+    ///
+    /// Stops any running prefetch workers. The PrefetchManager is retained
+    /// for potential reuse on the next start_prefetch call.
     pub fn stop_prefetch(&self) {
-        log::debug!("Stopping prefetch");
+        log::info!("Stopping prefetch");
+
+        // Stop the prefetch manager if active
+        if let Some(ref manager) = *self.prefetch_manager.lock() {
+            manager.stop();
+        }
+
         self.is_prefetching.store(false, Ordering::Release);
     }
 
