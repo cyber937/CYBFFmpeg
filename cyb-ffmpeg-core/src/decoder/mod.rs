@@ -10,12 +10,15 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::cache::{Cache, CacheConfig};
 use crate::error::{Error, Result};
+use crate::threading::{PrefetchContext, PrefetchManager};
 
-mod config;
-mod ffmpeg_decoder;
+mod audio_frame;
+pub(crate) mod config;
+pub(crate) mod ffmpeg_decoder;
 mod frame;
 mod info;
 
+pub use audio_frame::{AudioFrame, SampleFormat};
 pub use config::{DecoderConfig, PixelFormat};
 pub use frame::VideoFrame;
 pub use info::{AudioTrack, CodecInfo, MediaInfo, VideoTrack};
@@ -48,11 +51,14 @@ pub struct Decoder {
     /// Whether prefetch is active
     is_prefetching: AtomicBool,
 
-    /// Current playhead position in microseconds
-    current_time_us: AtomicI64,
+    /// Current playhead position in microseconds (shared with prefetch workers)
+    current_time_us: Arc<AtomicI64>,
 
     /// Current frame number
     current_frame: AtomicI64,
+
+    /// Prefetch manager (created on first start_prefetch call)
+    prefetch_manager: Mutex<Option<Arc<PrefetchManager>>>,
 }
 
 impl Decoder {
@@ -81,8 +87,9 @@ impl Decoder {
             is_prepared: AtomicBool::new(false),
             is_decoding: AtomicBool::new(false),
             is_prefetching: AtomicBool::new(false),
-            current_time_us: AtomicI64::new(0),
+            current_time_us: Arc::new(AtomicI64::new(0)),
             current_frame: AtomicI64::new(0),
+            prefetch_manager: Mutex::new(None),
         })
     }
 
@@ -95,10 +102,20 @@ impl Decoder {
         log::info!("Preparing decoder for: {}", self.path);
 
         // Initialize FFmpeg context
-        let ctx = FFmpegContext::new(&self.path, &self.config)?;
+        let mut ctx = FFmpegContext::new(&self.path, &self.config)?;
 
         // Extract media info
         let media_info = ctx.get_media_info()?;
+
+        // Build keyframe index for fast seeking (synchronous during prepare)
+        // Limit to 2000 entries to prevent excessive memory usage on very long videos
+        let keyframe_count = ctx.build_keyframe_index(2000).unwrap_or_else(|e| {
+            log::warn!("Failed to build keyframe index: {:?}", e);
+            0
+        });
+        if keyframe_count > 0 {
+            log::info!("Built keyframe index with {} entries", keyframe_count);
+        }
 
         // Store context and info
         {
@@ -155,7 +172,7 @@ impl Decoder {
         self.is_decoding.store(false, Ordering::Release);
     }
 
-    /// Seek to time in microseconds
+    /// Seek to time in microseconds (keyframe seek)
     pub fn seek(&self, time_us: i64) -> Result<()> {
         if !self.is_prepared() {
             log::warn!("Decoder::seek - not prepared");
@@ -178,6 +195,77 @@ impl Decoder {
 
         log::info!("Decoder::seek - done");
         Ok(())
+    }
+
+    /// Seek precisely to time in microseconds (frame-accurate seek).
+    /// This performs a keyframe seek first, then decodes frames until reaching the target time.
+    /// Returns the frame at or just before the target time.
+    pub fn seek_precise(&self, time_us: i64) -> Result<Option<VideoFrame>> {
+        if !self.is_prepared() {
+            log::warn!("Decoder::seek_precise - not prepared");
+            return Err(Error::NotPrepared);
+        }
+
+        log::info!("Decoder::seek_precise - acquiring lock for {} us", time_us);
+
+        let mut ctx_lock = self.ffmpeg_ctx.lock();
+        log::info!("Decoder::seek_precise - lock acquired");
+
+        if let Some(ref mut ctx) = *ctx_lock {
+            log::info!("Decoder::seek_precise - calling FFmpegContext::seek_precise");
+            let frame = ctx.seek_precise(time_us)?;
+
+            if let Some(ref f) = frame {
+                log::info!(
+                    "Decoder::seek_precise - got frame at {} us, updating current_time_us",
+                    f.pts_us
+                );
+                self.current_time_us.store(f.pts_us, Ordering::Release);
+                self.current_frame.store(f.frame_number, Ordering::Release);
+
+                // Cache the frame
+                if f.is_keyframe {
+                    self.cache.insert_l2(f.pts_us, f.clone());
+                }
+                self.cache.insert_l1(f.pts_us, f.clone());
+            } else {
+                log::warn!("Decoder::seek_precise - no frame returned");
+            }
+
+            log::info!("Decoder::seek_precise - done");
+            return Ok(frame);
+        } else {
+            log::warn!("Decoder::seek_precise - no FFmpeg context");
+        }
+
+        Ok(None)
+    }
+
+    /// Prime the audio decoder after seek.
+    /// Call this after seek() and before get_next_audio_frame() to ensure
+    /// audio packets are pre-loaded into the queue for immediate decoding.
+    /// This is necessary because after seek, the first packets read from the
+    /// stream may be video packets, leaving the audio queue empty.
+    /// Returns the number of audio packets that were queued.
+    pub fn prime_audio_after_seek(&self) -> Result<u32> {
+        if !self.is_prepared() {
+            log::warn!("Decoder::prime_audio_after_seek - not prepared");
+            return Err(Error::NotPrepared);
+        }
+
+        log::info!("Decoder::prime_audio_after_seek - acquiring lock");
+
+        let mut ctx_lock = self.ffmpeg_ctx.lock();
+
+        if let Some(ref mut ctx) = *ctx_lock {
+            log::info!("Decoder::prime_audio_after_seek - calling FFmpegContext::prime_audio_after_seek");
+            let count = ctx.prime_audio_after_seek()?;
+            log::info!("Decoder::prime_audio_after_seek - done, queued {} audio packets", count);
+            Ok(count)
+        } else {
+            log::warn!("Decoder::prime_audio_after_seek - no FFmpeg context");
+            Ok(0)
+        }
     }
 
     /// Get frame at specific time
@@ -304,27 +392,132 @@ impl Decoder {
         Ok(None)
     }
 
+    /// Get next audio frame in sequence
+    pub fn get_next_audio_frame(&self) -> Result<Option<AudioFrame>> {
+        if !self.is_prepared() {
+            return Err(Error::NotPrepared);
+        }
+
+        if !self.is_decoding() {
+            return Ok(None);
+        }
+
+        let mut ctx_lock = self.ffmpeg_ctx.lock();
+        if let Some(ref mut ctx) = *ctx_lock {
+            if let Some(frame) = ctx.decode_next_audio_frame()? {
+                return Ok(Some(frame));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Check if media has audio
+    pub fn has_audio(&self) -> bool {
+        if let Some(ref info) = *self.media_info.read() {
+            return !info.audio_tracks.is_empty();
+        }
+        false
+    }
+
+    /// Get audio sample rate
+    pub fn audio_sample_rate(&self) -> u32 {
+        let ctx_lock = self.ffmpeg_ctx.lock();
+        if let Some(ref ctx) = *ctx_lock {
+            return ctx.audio_sample_rate();
+        }
+        0
+    }
+
+    /// Get audio channels
+    pub fn audio_channels(&self) -> u32 {
+        let ctx_lock = self.ffmpeg_ctx.lock();
+        if let Some(ref ctx) = *ctx_lock {
+            return ctx.audio_channels();
+        }
+        0
+    }
+
     /// Start prefetch
+    ///
+    /// Starts background prefetching of frames in the specified direction.
+    /// This creates or reuses a PrefetchManager with 2 worker threads that
+    /// decode frames ahead of the current position for smooth scrubbing.
+    ///
+    /// # Arguments
+    /// * `direction` - Prefetch direction (1 = forward, -1 = backward)
+    /// * `velocity` - Scrub velocity in x speed (1.0 = normal speed)
     pub fn start_prefetch(&self, direction: i32, velocity: f64) -> Result<()> {
         if !self.is_prepared() {
             return Err(Error::NotPrepared);
         }
 
-        log::debug!(
+        // Skip if prefetch is disabled in config
+        if !self.config.enable_prefetch {
+            log::debug!("Prefetch disabled in config, skipping");
+            return Ok(());
+        }
+
+        log::info!(
             "Starting prefetch: direction={}, velocity={}",
             direction,
             velocity
         );
-        self.is_prefetching.store(true, Ordering::Release);
 
-        // TODO: Start prefetch worker threads
-        // For now, just set the flag
+        // Get media info for frame rate and duration
+        let (frame_rate, duration_us) = {
+            let info = self.media_info.read();
+            if let Some(ref info) = *info {
+                let fr = info.primary_video().map(|v| v.frame_rate).unwrap_or(30.0);
+                // Convert duration from seconds to microseconds
+                let dur = (info.duration * 1_000_000.0) as i64;
+                (fr, dur)
+            } else {
+                (30.0, 0)
+            }
+        };
+
+        // Create or get prefetch manager
+        let mut pm_lock = self.prefetch_manager.lock();
+        let manager = if pm_lock.is_none() {
+            // Create new prefetch context
+            let context = PrefetchContext::new(
+                self.path.clone(),
+                self.config.clone(),
+                self.cache.clone(),
+                self.current_time_us.clone(),
+                frame_rate,
+                duration_us,
+            );
+
+            // Create manager with 2 threads (as specified in plan)
+            let manager = PrefetchManager::new_with_context(2, context);
+            *pm_lock = Some(manager.clone());
+            manager
+        } else {
+            pm_lock.as_ref().unwrap().clone()
+        };
+
+        // Start prefetching
+        let current = self.current_time_us.load(Ordering::Acquire);
+        manager.start(direction, velocity, current);
+
+        self.is_prefetching.store(true, Ordering::Release);
         Ok(())
     }
 
     /// Stop prefetch
+    ///
+    /// Stops any running prefetch workers. The PrefetchManager is retained
+    /// for potential reuse on the next start_prefetch call.
     pub fn stop_prefetch(&self) {
-        log::debug!("Stopping prefetch");
+        log::info!("Stopping prefetch");
+
+        // Stop the prefetch manager if active
+        if let Some(ref manager) = *self.prefetch_manager.lock() {
+            manager.stop();
+        }
+
         self.is_prefetching.store(false, Ordering::Release);
     }
 

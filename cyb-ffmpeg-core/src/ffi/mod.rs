@@ -9,7 +9,7 @@ use std::ptr;
 use parking_lot::Mutex;
 
 use crate::cache::CacheStatistics;
-use crate::decoder::{Decoder, DecoderConfig, MediaInfo, PixelFormat, VideoFrame};
+use crate::decoder::{AudioFrame, Decoder, DecoderConfig, MediaInfo, PixelFormat, VideoFrame};
 use crate::error::Error;
 
 // Thread-local error storage
@@ -310,7 +310,7 @@ pub extern "C" fn cyb_decoder_stop(handle: *mut CybDecoderHandle) -> CybResult {
     CybResult::Success
 }
 
-/// Seek
+/// Seek (keyframe seek - fast but may not be frame-accurate)
 #[no_mangle]
 pub extern "C" fn cyb_decoder_seek(handle: *mut CybDecoderHandle, time_us: i64) -> CybResult {
     log::info!("FFI::cyb_decoder_seek - time_us={}", time_us);
@@ -323,6 +323,79 @@ pub extern "C" fn cyb_decoder_seek(handle: *mut CybDecoderHandle, time_us: i64) 
     let result: CybResult = handle.decoder.lock().seek(time_us).into();
     log::info!("FFI::cyb_decoder_seek - done, result={:?}", result);
     result
+}
+
+/// Seek precisely (frame-accurate seek).
+/// This performs a keyframe seek first, then decodes frames until reaching the target time.
+/// Returns the frame at or just before the target time.
+#[no_mangle]
+pub extern "C" fn cyb_decoder_seek_precise(
+    handle: *mut CybDecoderHandle,
+    time_us: i64,
+    out_frame: *mut *mut CybFrameHandle,
+) -> CybResult {
+    log::info!("FFI::cyb_decoder_seek_precise - time_us={}", time_us);
+    if handle.is_null() || out_frame.is_null() {
+        log::warn!("FFI::cyb_decoder_seek_precise - handle or out_frame is null");
+        return CybResult::ErrorInvalidHandle;
+    }
+
+    let handle = unsafe { &*handle };
+    log::info!("FFI::cyb_decoder_seek_precise - acquiring lock");
+    let decoder = handle.decoder.lock();
+    log::info!("FFI::cyb_decoder_seek_precise - lock acquired, calling seek_precise");
+
+    match decoder.seek_precise(time_us) {
+        Ok(Some(frame)) => {
+            log::info!(
+                "FFI::cyb_decoder_seek_precise - got frame: pts={} us, {}x{}",
+                frame.pts_us,
+                frame.width,
+                frame.height
+            );
+            let frame_handle = Box::new(CybFrameHandle { frame });
+            unsafe {
+                *out_frame = Box::into_raw(frame_handle);
+            }
+            CybResult::Success
+        }
+        Ok(None) => {
+            log::info!("FFI::cyb_decoder_seek_precise - no frame");
+            unsafe {
+                *out_frame = ptr::null_mut();
+            }
+            CybResult::Success
+        }
+        Err(e) => {
+            log::error!("FFI::cyb_decoder_seek_precise - error: {:?}", e);
+            e.into()
+        }
+    }
+}
+
+/// Prime audio decoder after seek.
+/// Call this after seek and before reading audio frames to ensure
+/// audio packets are pre-loaded into the queue for immediate decoding.
+/// Returns the number of audio packets queued, or 0 if no audio.
+#[no_mangle]
+pub extern "C" fn cyb_decoder_prime_audio_after_seek(handle: *mut CybDecoderHandle) -> u32 {
+    log::info!("FFI::cyb_decoder_prime_audio_after_seek");
+    if handle.is_null() {
+        log::warn!("FFI::cyb_decoder_prime_audio_after_seek - handle is null");
+        return 0;
+    }
+    let handle = unsafe { &*handle };
+    match handle.decoder.lock().prime_audio_after_seek() {
+        Ok(count) => {
+            log::info!("FFI::cyb_decoder_prime_audio_after_seek - done, queued {} packets", count);
+            count
+        }
+        Err(e) => {
+            log::error!("FFI::cyb_decoder_prime_audio_after_seek - error: {:?}", e);
+            set_last_error(&e.to_string());
+            0
+        }
+    }
 }
 
 /// Get current time
@@ -750,6 +823,129 @@ pub extern "C" fn cyb_decoder_is_decoding(handle: *const CybDecoderHandle) -> bo
     }
     let handle = unsafe { &*handle };
     handle.decoder.lock().is_decoding()
+}
+
+// =============================================================================
+// Audio Frame Types
+// =============================================================================
+
+/// Audio frame data for FFI
+#[repr(C)]
+pub struct CybAudioFrame {
+    /// Raw sample data pointer (interleaved float32)
+    pub data: *const f32,
+    /// Number of samples per channel
+    pub sample_count: u32,
+    /// Number of audio channels
+    pub channels: u32,
+    /// Sample rate in Hz
+    pub sample_rate: u32,
+    /// Presentation timestamp in microseconds
+    pub pts_us: i64,
+    /// Duration in microseconds
+    pub duration_us: i64,
+    /// Sequential frame number
+    pub frame_number: i64,
+}
+
+/// Opaque audio frame handle (owns the data)
+pub struct CybAudioFrameHandle {
+    frame: AudioFrame,
+}
+
+/// Get next audio frame in sequence
+#[no_mangle]
+pub extern "C" fn cyb_decoder_get_next_audio_frame(
+    handle: *mut CybDecoderHandle,
+    out_frame: *mut *mut CybAudioFrameHandle,
+) -> CybResult {
+    if handle.is_null() || out_frame.is_null() {
+        return CybResult::ErrorInvalidHandle;
+    }
+
+    let handle = unsafe { &*handle };
+    let mut decoder = handle.decoder.lock();
+
+    match decoder.get_next_audio_frame() {
+        Ok(Some(frame)) => {
+            let frame_handle = Box::new(CybAudioFrameHandle { frame });
+            unsafe {
+                *out_frame = Box::into_raw(frame_handle);
+            }
+            CybResult::Success
+        }
+        Ok(None) => {
+            unsafe {
+                *out_frame = ptr::null_mut();
+            }
+            CybResult::Success
+        }
+        Err(e) => e.into(),
+    }
+}
+
+/// Get audio frame data from handle
+#[no_mangle]
+pub extern "C" fn cyb_audio_frame_get_data(
+    frame_handle: *const CybAudioFrameHandle,
+    out_frame: *mut CybAudioFrame,
+) {
+    if frame_handle.is_null() || out_frame.is_null() {
+        return;
+    }
+
+    let frame_handle = unsafe { &*frame_handle };
+    let frame = &frame_handle.frame;
+
+    unsafe {
+        (*out_frame).data = frame.data_ptr();
+        (*out_frame).sample_count = frame.sample_count;
+        (*out_frame).channels = frame.channels;
+        (*out_frame).sample_rate = frame.sample_rate;
+        (*out_frame).pts_us = frame.pts_us;
+        (*out_frame).duration_us = frame.duration_us;
+        (*out_frame).frame_number = frame.frame_number;
+    }
+}
+
+/// Release audio frame handle
+#[no_mangle]
+pub extern "C" fn cyb_audio_frame_release(frame_handle: *mut CybAudioFrameHandle) {
+    if !frame_handle.is_null() {
+        unsafe {
+            drop(Box::from_raw(frame_handle));
+        }
+    }
+}
+
+/// Check if decoder has audio
+#[no_mangle]
+pub extern "C" fn cyb_decoder_has_audio(handle: *const CybDecoderHandle) -> bool {
+    if handle.is_null() {
+        return false;
+    }
+    let handle = unsafe { &*handle };
+    handle.decoder.lock().has_audio()
+}
+
+/// Get audio sample rate
+#[no_mangle]
+pub extern "C" fn cyb_decoder_get_audio_sample_rate(handle: *const CybDecoderHandle) -> u32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &*handle };
+    handle.decoder.lock().audio_sample_rate()
+}
+
+/// Get audio channel count
+#[no_mangle]
+pub extern "C" fn cyb_decoder_get_audio_channels(handle: *const CybDecoderHandle) -> u32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &*handle };
+    handle.decoder.lock().audio_channels()
 }
 
 #[cfg(test)]

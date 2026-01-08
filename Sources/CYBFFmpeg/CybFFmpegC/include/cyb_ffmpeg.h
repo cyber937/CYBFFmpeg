@@ -27,6 +27,9 @@ typedef enum CybResult {
     CYB_RESULT_ERROR_UNKNOWN = 99,
 } CybResult;
 
+// Opaque audio frame handle (owns the data)
+typedef struct CybAudioFrameHandle CybAudioFrameHandle;
+
 // Opaque decoder handle
 typedef struct CybDecoderHandle CybDecoderHandle;
 
@@ -115,6 +118,24 @@ typedef struct CybAudioTrack {
     int64_t bit_rate;
 } CybAudioTrack;
 
+// Audio frame data for FFI
+typedef struct CybAudioFrame {
+    // Raw sample data pointer (interleaved float32)
+    const float *data;
+    // Number of samples per channel
+    uint32_t sample_count;
+    // Number of audio channels
+    uint32_t channels;
+    // Sample rate in Hz
+    uint32_t sample_rate;
+    // Presentation timestamp in microseconds
+    int64_t pts_us;
+    // Duration in microseconds
+    int64_t duration_us;
+    // Sequential frame number
+    int64_t frame_number;
+} CybAudioFrame;
+
 // Get last error message
  const char *cyb_get_last_error(void) ;
 
@@ -158,8 +179,22 @@ void cyb_decoder_get_cache_stats(const struct CybDecoderHandle *handle,
 // Stop decoding
  enum CybResult cyb_decoder_stop(struct CybDecoderHandle *handle) ;
 
-// Seek
+// Seek (keyframe seek - fast but may not be frame-accurate)
  enum CybResult cyb_decoder_seek(struct CybDecoderHandle *handle, int64_t time_us) ;
+
+// Seek precisely (frame-accurate seek).
+// This performs a keyframe seek first, then decodes frames until reaching the target time.
+// Returns the frame at or just before the target time.
+enum CybResult cyb_decoder_seek_precise(struct CybDecoderHandle *handle,
+                                        int64_t time_us,
+                                        struct CybFrameHandle **out_frame)
+;
+
+// Prime audio decoder after seek.
+// Call this after seek and before reading audio frames to ensure
+// audio packets are pre-loaded into the queue for immediate decoding.
+// Returns the number of audio packets queued, or 0 if no audio.
+ uint32_t cyb_decoder_prime_audio_after_seek(struct CybDecoderHandle *handle) ;
 
 // Get current time
  int64_t cyb_decoder_get_current_time(const struct CybDecoderHandle *handle) ;
@@ -234,5 +269,29 @@ enum CybResult cyb_media_info_get_audio_track(const struct CybMediaInfoHandle *i
 
 // Check if decoding is active
  bool cyb_decoder_is_decoding(const struct CybDecoderHandle *handle) ;
+
+// Get next audio frame in sequence
+
+enum CybResult cyb_decoder_get_next_audio_frame(struct CybDecoderHandle *handle,
+                                                struct CybAudioFrameHandle **out_frame)
+;
+
+// Get audio frame data from handle
+
+void cyb_audio_frame_get_data(const struct CybAudioFrameHandle *frame_handle,
+                              struct CybAudioFrame *out_frame)
+;
+
+// Release audio frame handle
+ void cyb_audio_frame_release(struct CybAudioFrameHandle *frame_handle) ;
+
+// Check if decoder has audio
+ bool cyb_decoder_has_audio(const struct CybDecoderHandle *handle) ;
+
+// Get audio sample rate
+ uint32_t cyb_decoder_get_audio_sample_rate(const struct CybDecoderHandle *handle) ;
+
+// Get audio channel count
+ uint32_t cyb_decoder_get_audio_channels(const struct CybDecoderHandle *handle) ;
 
 #endif  /* CYB_FFMPEG_H */

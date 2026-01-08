@@ -37,7 +37,7 @@ fn main() {
 /// Find FFmpeg libraries using pkg-config or fallback paths
 fn find_ffmpeg_libs() {
     // Try pkg-config first
-    let libs = ["libavcodec", "libavformat", "libavutil", "libswscale"];
+    let libs = ["libavcodec", "libavformat", "libavutil", "libswscale", "libswresample"];
 
     let mut found_all = true;
     for lib in &libs {
@@ -103,6 +103,7 @@ fn try_fallback_paths() {
     println!("cargo:rustc-link-lib=dylib=avformat");
     println!("cargo:rustc-link-lib=dylib=avutil");
     println!("cargo:rustc-link-lib=dylib=swscale");
+    println!("cargo:rustc-link-lib=dylib=swresample");
 }
 
 /// Generate C header using cbindgen

@@ -162,4 +162,315 @@ final class CYBFFmpegTests: XCTestCase {
         XCTAssertEqual(PixelFormat(rawValue: 2), .yuv420p)
         XCTAssertEqual(PixelFormat(rawValue: 99), .bgra)  // Unknown defaults to bgra
     }
+
+    // MARK: - Video Decoding Tests
+
+    func testVideoDecodingMKV() async throws {
+        // Path to the sample MKV file
+        let samplePath = URL(fileURLWithPath: "PACKAGE_ROOT_PATH/samples/sample_1280x720_surfing_with_audio.mkv")
+
+        guard FileManager.default.fileExists(atPath: samplePath.path) else {
+            print("Skipping test: sample file not found at \(samplePath.path)")
+            return
+        }
+
+        // Create decoder
+        let decoder = try FFmpegDecoder(url: samplePath)
+        try await decoder.prepare()
+
+        // Verify media info
+        guard let mediaInfo = decoder.mediaInfo else {
+            XCTFail("Media info should be available after prepare")
+            return
+        }
+
+        XCTAssertGreaterThan(mediaInfo.duration, 0, "Duration should be positive")
+        XCTAssertFalse(mediaInfo.videoTracks.isEmpty, "MKV should have video tracks")
+
+        if let videoTrack = mediaInfo.videoTracks.first {
+            XCTAssertEqual(videoTrack.width, 1280, "Video width should be 1280")
+            XCTAssertEqual(videoTrack.height, 720, "Video height should be 720")
+            XCTAssertGreaterThan(videoTrack.frameRate, 0, "Frame rate should be positive")
+            print("Video: \(videoTrack.width)x\(videoTrack.height) @ \(videoTrack.frameRate)fps, codec: \(videoTrack.codec.name)")
+        }
+
+        // Start decoding
+        decoder.startDecoding()
+
+        // Decode a few frames
+        var frameCount = 0
+        var lastPTS: Double = -1
+
+        for _ in 0..<5 {
+            if let frame = decoder.getNextFrame() {
+                XCTAssertEqual(frame.width, 1280, "Frame width should match")
+                XCTAssertEqual(frame.height, 720, "Frame height should match")
+                XCTAssertNotNil(frame.pixelBuffer, "Frame should have pixel buffer")
+                XCTAssertGreaterThanOrEqual(frame.presentationTime, lastPTS, "PTS should be monotonically increasing")
+
+                lastPTS = frame.presentationTime
+                frameCount += 1
+
+                print("Frame \(frameCount): \(frame.width)x\(frame.height), pts=\(frame.presentationTime)s, keyframe=\(frame.isKeyframe)")
+            }
+        }
+
+        XCTAssertGreaterThan(frameCount, 0, "Should have decoded at least one video frame")
+
+        // Cleanup
+        decoder.stopDecoding()
+        decoder.invalidate()
+    }
+
+    func testVideoDecodingWebM() async throws {
+        // Path to the sample WebM file (VP9)
+        let samplePath = URL(fileURLWithPath: "PACKAGE_ROOT_PATH/samples/sample_960x400_ocean_with_audio.webm")
+
+        guard FileManager.default.fileExists(atPath: samplePath.path) else {
+            print("Skipping test: sample file not found at \(samplePath.path)")
+            return
+        }
+
+        // Create decoder
+        let decoder = try FFmpegDecoder(url: samplePath)
+        try await decoder.prepare()
+
+        // Verify media info
+        guard let mediaInfo = decoder.mediaInfo else {
+            XCTFail("Media info should be available after prepare")
+            return
+        }
+
+        XCTAssertGreaterThan(mediaInfo.duration, 0, "Duration should be positive")
+        XCTAssertFalse(mediaInfo.videoTracks.isEmpty, "WebM should have video tracks")
+
+        if let videoTrack = mediaInfo.videoTracks.first {
+            // VP9 codec
+            XCTAssertTrue(videoTrack.codec.name.contains("vp9") || videoTrack.codec.name.contains("vp8"),
+                          "WebM should use VP8/VP9 codec, got: \(videoTrack.codec.name)")
+            print("Video: \(videoTrack.width)x\(videoTrack.height), codec: \(videoTrack.codec.name)")
+        }
+
+        // Start decoding
+        decoder.startDecoding()
+
+        // Decode a few frames
+        var frameCount = 0
+
+        for _ in 0..<3 {
+            if let frame = decoder.getNextFrame() {
+                XCTAssertNotNil(frame.pixelBuffer, "Frame should have pixel buffer")
+                frameCount += 1
+                print("Frame \(frameCount): \(frame.width)x\(frame.height), pts=\(frame.presentationTime)s")
+            }
+        }
+
+        XCTAssertGreaterThan(frameCount, 0, "Should have decoded at least one VP9 frame")
+
+        // Cleanup
+        decoder.stopDecoding()
+        decoder.invalidate()
+    }
+
+    // MARK: - Seek Tests
+
+    func testSeekToMiddle() async throws {
+        // Path to the sample MKV file
+        let samplePath = URL(fileURLWithPath: "PACKAGE_ROOT_PATH/samples/sample_1280x720_surfing_with_audio.mkv")
+
+        guard FileManager.default.fileExists(atPath: samplePath.path) else {
+            print("Skipping test: sample file not found at \(samplePath.path)")
+            return
+        }
+
+        let decoder = try FFmpegDecoder(url: samplePath)
+        try await decoder.prepare()
+
+        guard let mediaInfo = decoder.mediaInfo else {
+            XCTFail("Media info should be available")
+            return
+        }
+
+        let duration = mediaInfo.duration
+        let targetTime = duration / 2.0  // Seek to middle
+
+        print("Duration: \(duration)s, seeking to: \(targetTime)s")
+
+        // Seek to middle
+        if let frame = try decoder.seek(to: targetTime) {
+            let pts = frame.presentationTime
+            let diff = abs(pts - targetTime)
+
+            print("Seeked to: \(pts)s (target: \(targetTime)s, diff: \(diff)s)")
+
+            // Allow tolerance of a few frames
+            XCTAssertLessThan(diff, 1.0, "Seek should land within 1 second of target")
+            XCTAssertNotNil(frame.pixelBuffer, "Frame should have pixel buffer after seek")
+        } else {
+            XCTFail("Seek should return a frame")
+        }
+
+        decoder.invalidate()
+    }
+
+    func testSeekToBeginning() async throws {
+        // Path to the sample file
+        let samplePath = URL(fileURLWithPath: "PACKAGE_ROOT_PATH/samples/sample_960x400_ocean_with_audio.wmv")
+
+        guard FileManager.default.fileExists(atPath: samplePath.path) else {
+            print("Skipping test: sample file not found at \(samplePath.path)")
+            return
+        }
+
+        let decoder = try FFmpegDecoder(url: samplePath)
+        try await decoder.prepare()
+
+        // First, decode a few frames
+        decoder.startDecoding()
+        for _ in 0..<5 {
+            _ = decoder.getNextFrame()
+        }
+        decoder.stopDecoding()
+
+        // Now seek back to beginning
+        if let frame = try decoder.seek(to: 0.0) {
+            let pts = frame.presentationTime
+
+            print("Seeked to beginning: pts=\(pts)s")
+
+            // Should be near the start (first frame might not be exactly 0)
+            XCTAssertLessThan(pts, 0.5, "Seek to 0 should land near the beginning")
+            XCTAssertNotNil(frame.pixelBuffer, "Frame should have pixel buffer")
+        } else {
+            XCTFail("Seek to beginning should return a frame")
+        }
+
+        decoder.invalidate()
+    }
+
+    func testSeekNearEnd() async throws {
+        // Path to the sample file
+        let samplePath = URL(fileURLWithPath: "PACKAGE_ROOT_PATH/samples/sample_960x400_ocean_with_audio.wmv")
+
+        guard FileManager.default.fileExists(atPath: samplePath.path) else {
+            print("Skipping test: sample file not found at \(samplePath.path)")
+            return
+        }
+
+        let decoder = try FFmpegDecoder(url: samplePath)
+        try await decoder.prepare()
+
+        guard let mediaInfo = decoder.mediaInfo else {
+            XCTFail("Media info should be available")
+            return
+        }
+
+        let duration = mediaInfo.duration
+        let targetTime = duration - 1.0  // 1 second before end
+
+        print("Duration: \(duration)s, seeking to: \(targetTime)s")
+
+        if let frame = try decoder.seek(to: targetTime) {
+            let pts = frame.presentationTime
+
+            print("Seeked near end: pts=\(pts)s")
+
+            // Should be within reasonable range
+            XCTAssertGreaterThan(pts, duration - 2.0, "Should be near the end")
+            XCTAssertNotNil(frame.pixelBuffer, "Frame should have pixel buffer")
+        } else {
+            // Seeking near end might not always succeed depending on file structure
+            print("Seek near end returned nil (acceptable for some formats)")
+        }
+
+        decoder.invalidate()
+    }
+
+    func testSeekMultipleTimes() async throws {
+        // Path to the sample file
+        let samplePath = URL(fileURLWithPath: "PACKAGE_ROOT_PATH/samples/sample_1280x720_surfing_with_audio.mkv")
+
+        guard FileManager.default.fileExists(atPath: samplePath.path) else {
+            print("Skipping test: sample file not found at \(samplePath.path)")
+            return
+        }
+
+        let decoder = try FFmpegDecoder(url: samplePath)
+        try await decoder.prepare()
+
+        guard let mediaInfo = decoder.mediaInfo else {
+            XCTFail("Media info should be available")
+            return
+        }
+
+        let duration = mediaInfo.duration
+        let seekTimes = [0.0, duration * 0.25, duration * 0.5, duration * 0.75, 0.0]
+        var successCount = 0
+
+        for targetTime in seekTimes {
+            if let frame = try decoder.seek(to: targetTime) {
+                print("Seek to \(targetTime)s -> got frame at \(frame.presentationTime)s")
+                successCount += 1
+            } else {
+                print("Seek to \(targetTime)s -> nil")
+            }
+        }
+
+        XCTAssertEqual(successCount, seekTimes.count, "All seeks should succeed")
+
+        decoder.invalidate()
+    }
+
+    // MARK: - Audio Decoding Tests
+
+    func testAudioDecodingWMV() async throws {
+        // Path to the sample WMV file (absolute path for reliability)
+        let samplePath = URL(fileURLWithPath: "PACKAGE_ROOT_PATH/samples/sample_960x400_ocean_with_audio.wmv")
+
+        guard FileManager.default.fileExists(atPath: samplePath.path) else {
+            print("Skipping test: sample file not found at \(samplePath.path)")
+            return
+        }
+
+        // Create decoder
+        let decoder = try FFmpegDecoder(url: samplePath)
+        try await decoder.prepare()
+
+        // Verify audio is available
+        XCTAssertTrue(decoder.hasAudio, "WMV file should have audio")
+        XCTAssertGreaterThan(decoder.audioSampleRate, 0, "Sample rate should be positive")
+        XCTAssertGreaterThan(decoder.audioChannels, 0, "Channel count should be positive")
+
+        print("Audio info: \(decoder.audioSampleRate)Hz, \(decoder.audioChannels) channels")
+
+        // Start decoding
+        decoder.startDecoding()
+
+        // Try to decode a few audio frames
+        var frameCount = 0
+        var totalSamples = 0
+
+        for _ in 0..<10 {
+            if let frame = decoder.getNextAudioFrame() {
+                XCTAssertGreaterThan(frame.sampleCount, 0, "Frame should have samples")
+                XCTAssertEqual(frame.channels, decoder.audioChannels, "Channel count should match")
+                XCTAssertEqual(frame.sampleRate, decoder.audioSampleRate, "Sample rate should match")
+                XCTAssertEqual(frame.samples.count, frame.sampleCount * frame.channels, "Sample array size should match")
+
+                frameCount += 1
+                totalSamples += frame.sampleCount
+
+                print("Frame \(frameCount): \(frame.sampleCount) samples, pts=\(frame.presentationTime)s")
+            }
+        }
+
+        XCTAssertGreaterThan(frameCount, 0, "Should have decoded at least one audio frame")
+        XCTAssertGreaterThan(totalSamples, 0, "Should have decoded some audio samples")
+
+        print("Decoded \(frameCount) frames with \(totalSamples) total samples")
+
+        // Cleanup
+        decoder.stopDecoding()
+        decoder.invalidate()
+    }
 }

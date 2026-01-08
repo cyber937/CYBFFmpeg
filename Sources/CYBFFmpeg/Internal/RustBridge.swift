@@ -153,17 +153,34 @@ internal final class RustBridge: @unchecked Sendable {
         return try? Self.convertFrame(frameHandle)
     }
 
-    /// Seek to time
+    /// Seek to time (frame-accurate seek)
+    /// This performs a keyframe seek first, then decodes frames until reaching the target time.
+    /// Returns the frame at or just before the target time.
     func seek(to time: Double) throws -> FFmpegFrame? {
-        // First, perform the seek operation
+        try withHandle { handle in
+            let timeMicros = Int64(time * 1_000_000)
+
+            var frameHandle: OpaquePointer?
+            let result = cyb_decoder_seek_precise(handle, timeMicros, &frameHandle)
+            try Self.checkResult(result)
+
+            guard let frameHandle = frameHandle else {
+                return nil
+            }
+
+            defer { cyb_frame_release(frameHandle) }
+            return try Self.convertFrame(frameHandle)
+        }
+    }
+
+    /// Seek to keyframe (fast but not frame-accurate)
+    /// This only seeks to the nearest keyframe without decoding intermediate frames.
+    func seekToKeyframe(at time: Double) throws {
         try withHandle { handle in
             let timeMicros = Int64(time * 1_000_000)
             let result = cyb_decoder_seek(handle, timeMicros)
             try Self.checkResult(result)
         }
-
-        // Get frame at new position (after releasing the lock)
-        return try getFrame(at: time, tolerance: 0.033)
     }
 
     // MARK: - Prefetch
@@ -213,6 +230,52 @@ internal final class RustBridge: @unchecked Sendable {
             let result = cyb_decoder_clear_cache(handle)
             try Self.checkResult(result)
         }
+    }
+
+    // MARK: - Audio
+
+    /// Check if decoder has audio
+    func hasAudio() -> Bool {
+        guard let handle = handle else { return false }
+        return cyb_decoder_has_audio(handle)
+    }
+
+    /// Get audio sample rate
+    func audioSampleRate() -> Int {
+        guard let handle = handle else { return 0 }
+        return Int(cyb_decoder_get_audio_sample_rate(handle))
+    }
+
+    /// Get audio channel count
+    func audioChannels() -> Int {
+        guard let handle = handle else { return 0 }
+        return Int(cyb_decoder_get_audio_channels(handle))
+    }
+
+    /// Get next audio frame
+    func getNextAudioFrame() -> FFmpegAudioFrame? {
+        guard let handle = handle else { return nil }
+
+        var frameHandle: OpaquePointer?
+        let result = cyb_decoder_get_next_audio_frame(handle, &frameHandle)
+
+        guard result == CYB_RESULT_SUCCESS, let frameHandle = frameHandle else {
+            return nil
+        }
+
+        defer { cyb_audio_frame_release(frameHandle) }
+        return Self.convertAudioFrame(frameHandle)
+    }
+
+    /// Prime audio decoder after seek.
+    /// Call this after seek() and before getNextAudioFrame() to ensure
+    /// audio packets are pre-loaded into the queue for immediate decoding.
+    /// This is necessary because after seek, the first packets read from the
+    /// stream may be video packets, leaving the audio queue empty.
+    /// Returns the number of audio packets that were queued.
+    func primeAudioAfterSeek() -> Int {
+        guard let handle = handle else { return 0 }
+        return Int(cyb_decoder_prime_audio_after_seek(handle))
     }
 
     // MARK: - Private Helpers
@@ -365,6 +428,29 @@ internal final class RustBridge: @unchecked Sendable {
             isKeyframe: cybFrame.is_keyframe,
             width: Int(cybFrame.width),
             height: Int(cybFrame.height),
+            frameNumber: cybFrame.frame_number
+        )
+    }
+
+    private static func convertAudioFrame(_ frameHandle: OpaquePointer) -> FFmpegAudioFrame {
+        var cybFrame = CybAudioFrame()
+        cyb_audio_frame_get_data(frameHandle, &cybFrame)
+
+        // Copy audio samples from FFI pointer
+        let totalSamples = Int(cybFrame.sample_count) * Int(cybFrame.channels)
+        var samples: [Float] = []
+
+        if let dataPtr = cybFrame.data, totalSamples > 0 {
+            samples = Array(UnsafeBufferPointer(start: dataPtr, count: totalSamples))
+        }
+
+        return FFmpegAudioFrame(
+            samples: samples,
+            sampleCount: Int(cybFrame.sample_count),
+            channels: Int(cybFrame.channels),
+            sampleRate: Int(cybFrame.sample_rate),
+            presentationTime: Double(cybFrame.pts_us) / 1_000_000.0,
+            duration: Double(cybFrame.duration_us) / 1_000_000.0,
             frameNumber: cybFrame.frame_number
         )
     }
