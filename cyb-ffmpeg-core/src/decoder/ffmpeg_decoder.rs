@@ -91,6 +91,89 @@ pub struct FFmpegContext {
 
     /// Queue of video packets collected during audio decoding
     video_packet_queue: VecDeque<ffmpeg::Packet>,
+
+    /// Keyframe index for fast seeking (built during prepare)
+    keyframe_index: Option<KeyframeIndex>,
+}
+
+/// Keyframe index for fast seeking
+///
+/// Stores (pts_us, byte_position) pairs for all keyframes in the video stream.
+/// Built during prepare() by scanning all packets.
+#[derive(Debug, Clone)]
+pub struct KeyframeIndex {
+    /// Sorted list of (pts_us, byte_position) pairs
+    entries: Vec<(i64, i64)>,
+}
+
+impl KeyframeIndex {
+    /// Create a new empty keyframe index
+    pub fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    /// Number of keyframes in the index
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Check if the index is empty
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Add a keyframe entry
+    pub fn add(&mut self, pts_us: i64, byte_position: i64) {
+        self.entries.push((pts_us, byte_position));
+    }
+
+    /// Sort entries by PTS (should be called after building)
+    pub fn sort(&mut self) {
+        self.entries.sort_by_key(|(pts, _)| *pts);
+    }
+
+    /// Find the keyframe at or before the specified time using binary search
+    ///
+    /// Returns (pts_us, byte_position) of the keyframe, or None if no keyframe before the time.
+    pub fn find_keyframe_before(&self, pts_us: i64) -> Option<(i64, i64)> {
+        if self.entries.is_empty() {
+            return None;
+        }
+
+        // Binary search for the rightmost entry with pts <= target
+        match self.entries.binary_search_by_key(&pts_us, |(pts, _)| *pts) {
+            Ok(idx) => Some(self.entries[idx]),  // Exact match
+            Err(idx) => {
+                if idx == 0 {
+                    // All keyframes are after the target, use first one
+                    Some(self.entries[0])
+                } else {
+                    // Use the keyframe before the insertion point
+                    Some(self.entries[idx - 1])
+                }
+            }
+        }
+    }
+
+    /// Find the keyframe at or after the specified time using binary search
+    ///
+    /// Returns (pts_us, byte_position) of the keyframe, or None if no keyframe after the time.
+    pub fn find_keyframe_after(&self, pts_us: i64) -> Option<(i64, i64)> {
+        if self.entries.is_empty() {
+            return None;
+        }
+
+        match self.entries.binary_search_by_key(&pts_us, |(pts, _)| *pts) {
+            Ok(idx) => Some(self.entries[idx]),  // Exact match
+            Err(idx) => {
+                if idx >= self.entries.len() {
+                    None  // No keyframe after the target
+                } else {
+                    Some(self.entries[idx])
+                }
+            }
+        }
+    }
 }
 
 impl FFmpegContext {
@@ -151,6 +234,7 @@ impl FFmpegContext {
             prefer_hw: config.prefer_hardware_decoding,
             audio_packet_queue: VecDeque::with_capacity(64),
             video_packet_queue: VecDeque::with_capacity(32),
+            keyframe_index: None,
         };
 
         // Initialize video decoder if we have a video stream
@@ -705,6 +789,76 @@ impl FFmpegContext {
         })
     }
 
+    /// Seek directly to a byte position in the file.
+    ///
+    /// This is used by seek_precise() when a keyframe index is available,
+    /// allowing direct seeking to the exact byte position of a keyframe.
+    pub fn seek_to_byte_position(&mut self, byte_pos: i64) -> Result<()> {
+        log::info!("FFmpegContext::seek_to_byte_position - pos={}", byte_pos);
+
+        let byte_seek_result = unsafe {
+            ffmpeg::ffi::av_seek_frame(
+                self.input.as_mut_ptr(),
+                -1,
+                byte_pos,
+                ffmpeg::ffi::AVSEEK_FLAG_BYTE as i32,
+            )
+        };
+
+        if byte_seek_result < 0 {
+            log::warn!(
+                "FFmpegContext::seek_to_byte_position - av_seek_frame failed, trying avformat_seek_file"
+            );
+
+            // Try avformat_seek_file as fallback
+            let file_seek_result = unsafe {
+                ffmpeg::ffi::avformat_seek_file(
+                    self.input.as_mut_ptr(),
+                    -1,
+                    i64::MIN,
+                    byte_pos,
+                    byte_pos,
+                    ffmpeg::ffi::AVSEEK_FLAG_BYTE as i32,
+                )
+            };
+
+            if file_seek_result < 0 {
+                log::error!(
+                    "FFmpegContext::seek_to_byte_position - all methods failed for pos={}",
+                    byte_pos
+                );
+                return Err(Error::SeekFailed(byte_pos));
+            }
+        }
+
+        log::info!(
+            "FFmpegContext::seek_to_byte_position - seek succeeded to pos={}",
+            byte_pos
+        );
+
+        // Flush decoder buffers - critical after seek
+        if let Some(ref mut decoder) = self.video_decoder {
+            decoder.flush();
+        }
+        if let Some(ref mut decoder) = self.audio_decoder {
+            decoder.flush();
+        }
+
+        // Clear packet queues
+        self.audio_packet_queue.clear();
+        self.video_packet_queue.clear();
+
+        // Flush resampler
+        if let Some(ref mut resampler) = self.resampler {
+            let target_format = ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed);
+            let target_layout = ffmpeg::channel_layout::ChannelLayout::STEREO;
+            let mut flush_output = ffmpeg::frame::Audio::new(target_format, 4096, target_layout);
+            let _ = resampler.flush(&mut flush_output);
+        }
+
+        Ok(())
+    }
+
     /// Seek to a specific time in microseconds (seeks to nearest keyframe)
     pub fn seek(&mut self, time_us: i64) -> Result<()> {
         log::info!(
@@ -834,16 +988,43 @@ impl FFmpegContext {
     /// Seek precisely to a specific time in microseconds.
     /// This performs a keyframe seek first, then decodes frames until reaching the target time.
     /// Returns the frame at or just before the target time (frame-accurate seek).
+    ///
+    /// If a keyframe index is available, uses it for faster seeking by directly
+    /// jumping to the byte position of the nearest keyframe.
     pub fn seek_precise(&mut self, time_us: i64) -> Result<Option<VideoFrame>> {
         log::info!(
-            "FFmpegContext::seek_precise - time_us={}, time_base={}/{}",
+            "FFmpegContext::seek_precise - time_us={}, time_base={}/{}, has_index={}",
             time_us,
             self.video_time_base.numerator(),
-            self.video_time_base.denominator()
+            self.video_time_base.denominator(),
+            self.keyframe_index.is_some()
         );
 
-        // First, seek to keyframe at or before target
-        self.seek(time_us)?;
+        // Use keyframe index for faster seeking if available
+        if let Some(ref index) = self.keyframe_index {
+            if let Some((kf_pts, kf_pos)) = index.find_keyframe_before(time_us) {
+                log::info!(
+                    "FFmpegContext::seek_precise - using keyframe index: pts={} us, pos={} bytes",
+                    kf_pts,
+                    kf_pos
+                );
+
+                // Seek directly to byte position
+                if let Err(e) = self.seek_to_byte_position(kf_pos) {
+                    log::warn!(
+                        "FFmpegContext::seek_precise - byte seek failed: {:?}, falling back to time seek",
+                        e
+                    );
+                    self.seek(time_us)?;
+                }
+            } else {
+                // No keyframe found, fall back to regular seek
+                self.seek(time_us)?;
+            }
+        } else {
+            // No index available, use regular seek
+            self.seek(time_us)?;
+        }
 
         // Now decode frames until we reach the target time
         // We need to find the frame at or just before time_us
@@ -1692,6 +1873,97 @@ impl FFmpegContext {
         if let Some(ref mut decoder) = self.audio_decoder {
             decoder.flush();
         }
+    }
+
+    /// Build a keyframe index by scanning all packets in the file.
+    ///
+    /// This is called during prepare() to enable fast seeking.
+    /// The index contains (pts_us, byte_position) pairs for all keyframes.
+    ///
+    /// # Arguments
+    /// * `max_keyframes` - Maximum number of keyframes to index (to limit memory usage)
+    ///
+    /// # Returns
+    /// The number of keyframes indexed
+    pub fn build_keyframe_index(&mut self, max_keyframes: usize) -> Result<usize> {
+        let video_stream_index = match self.video_stream_index {
+            Some(idx) => idx,
+            None => {
+                log::debug!("No video stream, skipping keyframe index");
+                return Ok(0);
+            }
+        };
+
+        log::info!("Building keyframe index (max: {} entries)...", max_keyframes);
+        let start_time = std::time::Instant::now();
+
+        let mut index = KeyframeIndex::new();
+        let time_base = self.video_time_base;
+
+        // Read all packets and collect keyframe positions
+        loop {
+            match self.input.packets().next() {
+                Some((stream, packet)) => {
+                    // Only process video stream packets
+                    if stream.index() != video_stream_index {
+                        continue;
+                    }
+
+                    // Check if this is a keyframe
+                    if packet.is_key() {
+                        if let Some(pts) = packet.pts() {
+                            let pts_us = Self::pts_to_us(pts, time_base);
+                            let position = packet.position();
+
+                            // Only add if position is valid (>= 0)
+                            if position >= 0 {
+                                index.add(pts_us, position as i64);
+
+                                if index.len() >= max_keyframes {
+                                    log::warn!(
+                                        "Keyframe index limit reached: {} entries",
+                                        max_keyframes
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                None => break,
+            }
+        }
+
+        // Sort the index by PTS (should already be sorted, but ensure it)
+        index.sort();
+
+        let count = index.len();
+        let elapsed = start_time.elapsed();
+
+        log::info!(
+            "Keyframe index built: {} entries in {:?} ({:.1} entries/sec)",
+            count,
+            elapsed,
+            count as f64 / elapsed.as_secs_f64().max(0.001)
+        );
+
+        // Store the index
+        self.keyframe_index = Some(index);
+
+        // Seek back to the beginning of the file
+        self.seek(0)?;
+
+        Ok(count)
+    }
+
+    /// Get a reference to the keyframe index
+    pub fn keyframe_index(&self) -> Option<&KeyframeIndex> {
+        self.keyframe_index.as_ref()
+    }
+
+    /// Check if keyframe index is available
+    pub fn has_keyframe_index(&self) -> bool {
+        self.keyframe_index.is_some()
     }
 }
 
