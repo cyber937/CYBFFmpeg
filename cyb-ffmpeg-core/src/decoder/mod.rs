@@ -157,7 +157,7 @@ impl Decoder {
         self.is_decoding.store(false, Ordering::Release);
     }
 
-    /// Seek to time in microseconds
+    /// Seek to time in microseconds (keyframe seek)
     pub fn seek(&self, time_us: i64) -> Result<()> {
         if !self.is_prepared() {
             log::warn!("Decoder::seek - not prepared");
@@ -180,6 +180,50 @@ impl Decoder {
 
         log::info!("Decoder::seek - done");
         Ok(())
+    }
+
+    /// Seek precisely to time in microseconds (frame-accurate seek).
+    /// This performs a keyframe seek first, then decodes frames until reaching the target time.
+    /// Returns the frame at or just before the target time.
+    pub fn seek_precise(&self, time_us: i64) -> Result<Option<VideoFrame>> {
+        if !self.is_prepared() {
+            log::warn!("Decoder::seek_precise - not prepared");
+            return Err(Error::NotPrepared);
+        }
+
+        log::info!("Decoder::seek_precise - acquiring lock for {} us", time_us);
+
+        let mut ctx_lock = self.ffmpeg_ctx.lock();
+        log::info!("Decoder::seek_precise - lock acquired");
+
+        if let Some(ref mut ctx) = *ctx_lock {
+            log::info!("Decoder::seek_precise - calling FFmpegContext::seek_precise");
+            let frame = ctx.seek_precise(time_us)?;
+
+            if let Some(ref f) = frame {
+                log::info!(
+                    "Decoder::seek_precise - got frame at {} us, updating current_time_us",
+                    f.pts_us
+                );
+                self.current_time_us.store(f.pts_us, Ordering::Release);
+                self.current_frame.store(f.frame_number, Ordering::Release);
+
+                // Cache the frame
+                if f.is_keyframe {
+                    self.cache.insert_l2(f.pts_us, f.clone());
+                }
+                self.cache.insert_l1(f.pts_us, f.clone());
+            } else {
+                log::warn!("Decoder::seek_precise - no frame returned");
+            }
+
+            log::info!("Decoder::seek_precise - done");
+            return Ok(frame);
+        } else {
+            log::warn!("Decoder::seek_precise - no FFmpeg context");
+        }
+
+        Ok(None)
     }
 
     /// Prime the audio decoder after seek.

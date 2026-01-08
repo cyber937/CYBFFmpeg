@@ -179,8 +179,17 @@ void cyb_decoder_get_cache_stats(const struct CybDecoderHandle *handle,
 // Stop decoding
  enum CybResult cyb_decoder_stop(struct CybDecoderHandle *handle) ;
 
-// Seek
+// Seek (keyframe seek - fast but may not be frame-accurate)
  enum CybResult cyb_decoder_seek(struct CybDecoderHandle *handle, int64_t time_us) ;
+
+// Seek precisely (frame-accurate seek).
+// This performs a keyframe seek first, then decodes frames until reaching the target time.
+// Returns the frame at or just before the target time.
+
+enum CybResult cyb_decoder_seek_precise(struct CybDecoderHandle *handle,
+                                        int64_t time_us,
+                                        struct CybFrameHandle **out_frame)
+;
 
 // Prime audio decoder after seek.
 // Call this after seek and before reading audio frames to ensure
