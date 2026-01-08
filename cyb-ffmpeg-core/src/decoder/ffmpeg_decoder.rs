@@ -208,14 +208,29 @@ impl FFmpegContext {
         log::debug!("Raw durations - stream: {}, container: {}, AV_NOPTS_VALUE: {}",
             stream_duration, container_duration, ffmpeg::ffi::AV_NOPTS_VALUE);
 
-        if is_valid_duration(stream_duration) {
-            // Stream duration is most reliable
-            self.duration_us = Self::pts_to_us(stream_duration, self.video_time_base);
-            log::debug!("Duration from stream: {} us", self.duration_us);
-        } else if is_valid_duration(container_duration) {
-            // Container duration as fallback
-            self.duration_us = container_duration * 1_000_000 / ffmpeg::ffi::AV_TIME_BASE as i64;
-            log::debug!("Duration from container: {} us", self.duration_us);
+        // Calculate both durations and use the longer one
+        // This handles cases where audio is longer than video, or vice versa
+        let stream_duration_us = if is_valid_duration(stream_duration) {
+            Self::pts_to_us(stream_duration, self.video_time_base)
+        } else {
+            0
+        };
+        let container_duration_us = if is_valid_duration(container_duration) {
+            container_duration * 1_000_000 / ffmpeg::ffi::AV_TIME_BASE as i64
+        } else {
+            0
+        };
+
+        log::debug!("Calculated durations - stream: {} us, container: {} us",
+            stream_duration_us, container_duration_us);
+
+        if stream_duration_us > 0 || container_duration_us > 0 {
+            // Use the longer of the two durations
+            // This ensures we don't cut off audio if video is shorter, or vice versa
+            self.duration_us = stream_duration_us.max(container_duration_us);
+            log::debug!("Duration from {}: {} us ({:.2}s)",
+                if self.duration_us == stream_duration_us { "stream" } else { "container" },
+                self.duration_us, self.duration_us as f64 / 1_000_000.0);
         } else {
             // For elementary streams (.m2v, .m2a, etc.) with no duration info
             let bit_rate = unsafe { (*self.input.as_ptr()).bit_rate };
@@ -250,13 +265,59 @@ impl FFmpegContext {
             }
         }
 
-        // Get frame rate
-        let frame_rate = stream.avg_frame_rate();
-        if frame_rate.denominator() > 0 {
-            self.frame_rate = frame_rate.numerator() as f64 / frame_rate.denominator() as f64;
+        // Get frame rate - need to choose between r_frame_rate and avg_frame_rate carefully
+        // - r_frame_rate: For elementary streams (.m2v), this is accurate (e.g., 24000/1001)
+        // - avg_frame_rate: For container formats (.mpeg), this is often more accurate
+        // - r_frame_rate can be field rate (2x frame rate) for interlaced content in containers
+        let r_frame_rate = stream.rate();
+        let avg_frame_rate = stream.avg_frame_rate();
+
+        let r_fps = if r_frame_rate.denominator() > 0 {
+            r_frame_rate.numerator() as f64 / r_frame_rate.denominator() as f64
         } else {
-            self.frame_rate = 24.0; // Default
+            0.0
+        };
+        let avg_fps = if avg_frame_rate.denominator() > 0 {
+            avg_frame_rate.numerator() as f64 / avg_frame_rate.denominator() as f64
+        } else {
+            0.0
+        };
+
+        log::debug!("Frame rates - r_frame_rate: {}/{} = {:.3} fps, avg_frame_rate: {}/{} = {:.3} fps",
+            r_frame_rate.numerator(), r_frame_rate.denominator(), r_fps,
+            avg_frame_rate.numerator(), avg_frame_rate.denominator(), avg_fps);
+
+        let (frame_rate, rate_source) = if avg_fps > 0.0 && r_fps > 0.0 {
+            // Both are valid - check if r_frame_rate is a field rate (2x avg)
+            // For interlaced content, r_frame_rate can be field rate (48fps for 24fps content)
+            if (r_fps / avg_fps - 2.0).abs() < 0.1 {
+                // r_frame_rate is likely field rate, use avg_frame_rate
+                log::debug!("r_frame_rate appears to be field rate (2x avg), using avg_frame_rate");
+                (avg_frame_rate, "avg_frame_rate")
+            } else if self.duration_us == NEEDS_SCAN_MARKER {
+                // Elementary stream - prefer r_frame_rate
+                (r_frame_rate, "r_frame_rate")
+            } else {
+                // Container format with valid duration - prefer avg_frame_rate
+                (avg_frame_rate, "avg_frame_rate")
+            }
+        } else if r_fps > 0.0 {
+            (r_frame_rate, "r_frame_rate")
+        } else if avg_fps > 0.0 {
+            (avg_frame_rate, "avg_frame_rate")
+        } else {
+            // Default to 24 fps
+            self.frame_rate = 24.0;
+            log::warn!("No valid frame rate found, using default 24.0 fps");
+            (ffmpeg::Rational::new(24, 1), "default")
+        };
+
+        if rate_source != "default" {
+            self.frame_rate = frame_rate.numerator() as f64 / frame_rate.denominator() as f64;
         }
+
+        log::info!("Frame rate from {}: {}/{} = {:.6} fps",
+            rate_source, frame_rate.numerator(), frame_rate.denominator(), self.frame_rate);
 
         // If duration_us is negative (but not the scan marker), it contains frame count
         if self.duration_us < 0 && self.duration_us != NEEDS_SCAN_MARKER {
@@ -878,6 +939,19 @@ impl FFmpegContext {
             );
         }
 
+        // Clear audio packet queue after seek_precise.
+        // During seek_precise, audio packets are queued while decoding video frames to reach target.
+        // These audio packets may not be synchronized with the final video position.
+        // Clearing the queue ensures that prime_audio_after_seek will read fresh audio packets
+        // starting from the correct position.
+        if !self.audio_packet_queue.is_empty() {
+            log::info!(
+                "FFmpegContext::seek_precise - clearing {} stale audio packets from queue",
+                self.audio_packet_queue.len()
+            );
+            self.audio_packet_queue.clear();
+        }
+
         Ok(best_frame)
     }
 
@@ -900,6 +974,22 @@ impl FFmpegContext {
                 return Ok(0);
             }
         };
+
+        // Flush audio decoder to clear any stale decoded frames from previous position.
+        // This is critical after seek to ensure clean audio from the new position.
+        if let Some(ref mut decoder) = self.audio_decoder {
+            log::info!("prime_audio_after_seek - flushing audio decoder");
+            decoder.flush();
+        }
+
+        // Flush resampler to clear any buffered samples
+        if let Some(ref mut resampler) = self.resampler {
+            log::info!("prime_audio_after_seek - flushing audio resampler");
+            let target_format = ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed);
+            let target_layout = ffmpeg::channel_layout::ChannelLayout::STEREO;
+            let mut flush_output = ffmpeg::frame::Audio::new(target_format, 4096, target_layout);
+            let _ = resampler.flush(&mut flush_output);
+        }
 
         log::info!("prime_audio_after_seek - starting, audio_queue={}, video_queue={}",
             self.audio_packet_queue.len(), self.video_packet_queue.len());
