@@ -10,8 +10,8 @@ let packageDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent().pat
 // Path to Rust library (absolute path for Xcode compatibility)
 let rustLibPath = "\(packageDir)/cyb-ffmpeg-core/target/release"
 
-// Path to FFmpeg (Homebrew - supports both ffmpeg@7 and ffmpeg 8.x)
-let ffmpegPath = "/opt/homebrew/opt/ffmpeg"
+// Path to FFmpeg (local build for distribution)
+let ffmpegPath = "\(packageDir)/ffmpeg-build/output"
 
 let package = Package(
     name: "CYBFFmpeg",
