@@ -7,6 +7,22 @@ import XCTest
 @testable import CYBFFmpeg
 
 final class CYBFFmpegTests: XCTestCase {
+    // MARK: - Test Sample Path Helper
+
+    /// Returns the path to sample files for testing.
+    /// Set CYBFFMPEG_SAMPLES_PATH environment variable to override.
+    private func samplePath(_ filename: String) -> URL {
+        if let envPath = ProcessInfo.processInfo.environment["CYBFFMPEG_SAMPLES_PATH"] {
+            return URL(fileURLWithPath: envPath).appendingPathComponent(filename)
+        }
+        // Default: samples directory relative to package root
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // CYBFFmpegTests
+            .deletingLastPathComponent()  // Tests
+            .deletingLastPathComponent()  // Package root
+        return packageRoot.appendingPathComponent("samples").appendingPathComponent(filename)
+    }
+
     // MARK: - Configuration Tests
 
     func testDefaultConfiguration() {
@@ -167,7 +183,7 @@ final class CYBFFmpegTests: XCTestCase {
 
     func testVideoDecodingMKV() async throws {
         // Path to the sample MKV file
-        let samplePath = URL(fileURLWithPath: "PACKAGE_ROOT_PATH/samples/sample_1280x720_surfing_with_audio.mkv")
+        let samplePath = samplePath("sample_1280x720_surfing_with_audio.mkv")
 
         guard FileManager.default.fileExists(atPath: samplePath.path) else {
             print("Skipping test: sample file not found at \(samplePath.path)")
@@ -224,7 +240,7 @@ final class CYBFFmpegTests: XCTestCase {
 
     func testVideoDecodingWebM() async throws {
         // Path to the sample WebM file (VP9)
-        let samplePath = URL(fileURLWithPath: "PACKAGE_ROOT_PATH/samples/sample_960x400_ocean_with_audio.webm")
+        let samplePath = samplePath("sample_960x400_ocean_with_audio.webm")
 
         guard FileManager.default.fileExists(atPath: samplePath.path) else {
             print("Skipping test: sample file not found at \(samplePath.path)")
@@ -276,7 +292,7 @@ final class CYBFFmpegTests: XCTestCase {
 
     func testSeekToMiddle() async throws {
         // Path to the sample MKV file
-        let samplePath = URL(fileURLWithPath: "PACKAGE_ROOT_PATH/samples/sample_1280x720_surfing_with_audio.mkv")
+        let samplePath = samplePath("sample_1280x720_surfing_with_audio.mkv")
 
         guard FileManager.default.fileExists(atPath: samplePath.path) else {
             print("Skipping test: sample file not found at \(samplePath.path)")
@@ -315,7 +331,7 @@ final class CYBFFmpegTests: XCTestCase {
 
     func testSeekToBeginning() async throws {
         // Path to the sample file
-        let samplePath = URL(fileURLWithPath: "PACKAGE_ROOT_PATH/samples/sample_960x400_ocean_with_audio.wmv")
+        let samplePath = samplePath("sample_960x400_ocean_with_audio.wmv")
 
         guard FileManager.default.fileExists(atPath: samplePath.path) else {
             print("Skipping test: sample file not found at \(samplePath.path)")
@@ -350,7 +366,7 @@ final class CYBFFmpegTests: XCTestCase {
 
     func testSeekNearEnd() async throws {
         // Path to the sample file
-        let samplePath = URL(fileURLWithPath: "PACKAGE_ROOT_PATH/samples/sample_960x400_ocean_with_audio.wmv")
+        let samplePath = samplePath("sample_960x400_ocean_with_audio.wmv")
 
         guard FileManager.default.fileExists(atPath: samplePath.path) else {
             print("Skipping test: sample file not found at \(samplePath.path)")
@@ -388,7 +404,7 @@ final class CYBFFmpegTests: XCTestCase {
 
     func testSeekMultipleTimes() async throws {
         // Path to the sample file
-        let samplePath = URL(fileURLWithPath: "PACKAGE_ROOT_PATH/samples/sample_1280x720_surfing_with_audio.mkv")
+        let samplePath = samplePath("sample_1280x720_surfing_with_audio.mkv")
 
         guard FileManager.default.fileExists(atPath: samplePath.path) else {
             print("Skipping test: sample file not found at \(samplePath.path)")
@@ -424,8 +440,8 @@ final class CYBFFmpegTests: XCTestCase {
     // MARK: - Audio Decoding Tests
 
     func testAudioDecodingWMV() async throws {
-        // Path to the sample WMV file (absolute path for reliability)
-        let samplePath = URL(fileURLWithPath: "PACKAGE_ROOT_PATH/samples/sample_960x400_ocean_with_audio.wmv")
+        // Path to the sample WMV file
+        let samplePath = samplePath("sample_960x400_ocean_with_audio.wmv")
 
         guard FileManager.default.fileExists(atPath: samplePath.path) else {
             print("Skipping test: sample file not found at \(samplePath.path)")

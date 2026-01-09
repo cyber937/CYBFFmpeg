@@ -3,9 +3,8 @@
 
 import PackageDescription
 
-// Absolute path to CYBFFmpeg package directory
-// IMPORTANT: Update this path if the project location changes
-let packageDir = "PACKAGE_ROOT_PATH"
+// CYBFFmpeg package directory (resolved from Package.swift location)
+let packageDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
 
 // Path to Rust library (absolute path for Xcode compatibility)
 let rustLibPath = "\(packageDir)/cyb-ffmpeg-core/target/release"

@@ -202,15 +202,15 @@ internal enum PixelBufferConverter {
         srcStride: Int
     ) throws {
         // YUV420P: Y plane + U plane + V plane (all separate)
-        // For simplicity, convert to NV12 or BGRA if needed
-        // This is a placeholder - actual implementation would handle planar format
+        // Note: Full YUV420P support requires U/V plane interleaving to NV12.
+        // Current implementation copies Y plane only. For full color output,
+        // use BGRA or NV12 output format instead.
 
         guard CVPixelBufferGetPlaneCount(dst) >= 2 else {
             throw FFmpegError.invalidFormat("Expected planar buffer for YUV420P")
         }
 
-        // Similar to NV12 but with separate U and V planes
-        // For now, copy Y plane only (partial implementation)
+        // Copy Y plane (luminance)
         guard let yPlane = CVPixelBufferGetBaseAddressOfPlane(dst, 0) else {
             throw FFmpegError.memoryError
         }
@@ -222,8 +222,33 @@ internal enum PixelBufferConverter {
             memcpy(dstRow, srcRow, min(srcStride, yStride))
         }
 
-        // U and V planes would need interleaving to NV12 format
-        // This is left as a TODO for full YUV420P support
+        // Copy UV planes (chrominance)
+        // YUV420P has separate U and V planes, each at half resolution
+        let uvHeight = height / 2
+        let uvStride = srcStride / 2
+        let yPlaneSize = height * srcStride
+        let uPlaneSize = uvHeight * uvStride
+
+        guard let uvPlane = CVPixelBufferGetBaseAddressOfPlane(dst, 1) else {
+            throw FFmpegError.memoryError
+        }
+        let dstUVStride = CVPixelBufferGetBytesPerRowOfPlane(dst, 1)
+
+        // Interleave U and V planes into NV12 format (UV UV UV...)
+        let uSrc = src.advanced(by: yPlaneSize)
+        let vSrc = src.advanced(by: yPlaneSize + uPlaneSize)
+
+        for y in 0..<uvHeight {
+            let uRow = uSrc.advanced(by: y * uvStride)
+            let vRow = vSrc.advanced(by: y * uvStride)
+            let dstRow = uvPlane.advanced(by: y * dstUVStride)
+
+            // Interleave U and V bytes
+            for x in 0..<uvStride {
+                dstRow.storeBytes(of: uRow.load(fromByteOffset: x, as: UInt8.self), toByteOffset: x * 2, as: UInt8.self)
+                dstRow.storeBytes(of: vRow.load(fromByteOffset: x, as: UInt8.self), toByteOffset: x * 2 + 1, as: UInt8.self)
+            }
+        }
     }
 
     // MARK: - Cleanup
