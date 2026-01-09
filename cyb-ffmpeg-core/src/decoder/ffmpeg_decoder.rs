@@ -426,7 +426,7 @@ impl FFmpegContext {
 
         // Create decoder context
         let mut decoder_ctx = CodecContext::new_with_codec(decoder_codec);
-        decoder_ctx.set_parameters(codec_params).map_err(|e| {
+        decoder_ctx.set_parameters(codec_params.clone()).map_err(|e| {
             Error::DecodeFailed(format!("Failed to set codec parameters: {}", e))
         })?;
 
@@ -444,6 +444,21 @@ impl FFmpegContext {
 
         self.width = video_decoder.width();
         self.height = video_decoder.height();
+
+        // If decoder returns 0 dimensions, try to get from codec parameters
+        // This can happen with some formats like MPEG-1/2 before first frame decode
+        if self.width == 0 || self.height == 0 {
+            let params_width = unsafe { (*codec_params.as_ptr()).width as u32 };
+            let params_height = unsafe { (*codec_params.as_ptr()).height as u32 };
+            log::info!(
+                "Decoder returned {}x{}, trying codec params: {}x{}",
+                self.width, self.height, params_width, params_height
+            );
+            if params_width > 0 && params_height > 0 {
+                self.width = params_width;
+                self.height = params_height;
+            }
+        }
 
         // Check if we need to scan for duration (elementary stream marker)
         // NEEDS_SCAN_MARKER is defined earlier in this function

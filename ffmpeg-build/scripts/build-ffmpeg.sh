@@ -11,6 +11,9 @@
 # - MPEG-1/2/4 - Native LGPL
 # - DNxHD/HR - Native LGPL
 # - H.264/HEVC - VideoToolbox (Apple system framework)
+# - WMV1/2/3/VC-1 - Native LGPL (Windows Media Video)
+# - WMA - Native LGPL (Windows Media Audio)
+# - AC-3/E-AC-3 - Native LGPL (Dolby Digital)
 #
 # Usage:
 #   ./build-ffmpeg.sh [--clean] [--debug]
@@ -20,7 +23,7 @@
 set -e
 
 # Configuration
-FFMPEG_VERSION="7.0.1"
+FFMPEG_VERSION="8.0.1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/../build"
 OUTPUT_DIR="${SCRIPT_DIR}/../output"
@@ -200,6 +203,11 @@ configure_ffmpeg() {
         --enable-demuxer=mpegts
         --enable-demuxer=mpegps
         --enable-demuxer=mxf
+        --enable-demuxer=asf       # Windows Media / ASF container
+        --enable-demuxer=avi       # AVI container (ensure enabled)
+        --enable-demuxer=wav       # WAV audio container
+        --enable-demuxer=flac      # FLAC container
+        --enable-demuxer=ogg       # Ogg container
 
         # Enable parsers
         --enable-parser=h264
@@ -208,6 +216,7 @@ configure_ffmpeg() {
         --enable-parser=av1
         --enable-parser=mpeg4video
         --enable-parser=mpegvideo
+        --enable-parser=vc1         # VC-1 / WMV9 parser
 
         # Enable LGPL decoders
         --enable-decoder=h264
@@ -222,6 +231,15 @@ configure_ffmpeg() {
         --enable-decoder=prores
         --enable-decoder=dnxhd
         --enable-decoder=rawvideo
+        --enable-decoder=wmv1       # Windows Media Video 7
+        --enable-decoder=wmv2       # Windows Media Video 8
+        --enable-decoder=wmv3       # Windows Media Video 9
+        --enable-decoder=vc1        # SMPTE VC-1
+        --enable-decoder=wmv3image  # WMV9 Image
+        --enable-decoder=vc1image   # VC-1 Image
+        --enable-decoder=msmpeg4v1  # MS MPEG-4 v1
+        --enable-decoder=msmpeg4v2  # MS MPEG-4 v2
+        --enable-decoder=msmpeg4v3  # MS MPEG-4 v3 (DivX 3)
 
         # Audio decoders (all LGPL)
         --enable-decoder=aac
@@ -231,6 +249,17 @@ configure_ffmpeg() {
         --enable-decoder=pcm_s24le
         --enable-decoder=pcm_s32le
         --enable-decoder=pcm_f32le
+        --enable-decoder=wmav1      # Windows Media Audio v1
+        --enable-decoder=wmav2      # Windows Media Audio v2
+        --enable-decoder=wmalossless # WMA Lossless
+        --enable-decoder=wmapro     # WMA Pro
+        --enable-decoder=wmavoice   # WMA Voice
+        --enable-decoder=vorbis     # Vorbis (for Ogg)
+        --enable-decoder=opus       # Opus audio
+        --enable-decoder=ac3        # AC-3 / Dolby Digital
+        --enable-decoder=eac3       # E-AC-3
+        --enable-decoder=mp2        # MPEG Layer 2 audio
+        --enable-decoder=mp2float   # MP2 float decoder
 
         # Hardware-accelerated decoders (VideoToolbox)
         --enable-decoder=h264_videotoolbox
@@ -319,13 +348,16 @@ verify_lgpl() {
     fi
 
     # Check that GPL is NOT enabled
-    if grep -q "CONFIG_GPL=yes" "$config_file"; then
+    # In FFmpeg 8.x, disabled options are prefixed with "!"
+    # So "!CONFIG_GPL=yes" means GPL is DISABLED (which is what we want)
+    # We need to check for "CONFIG_GPL=yes" WITHOUT the "!" prefix
+    if grep -q "^CONFIG_GPL=yes" "$config_file"; then
         log_error "GPL is enabled! This build is NOT App Store compliant!"
         return 1
     fi
 
     # Check that nonfree is NOT enabled
-    if grep -q "CONFIG_NONFREE=yes" "$config_file"; then
+    if grep -q "^CONFIG_NONFREE=yes" "$config_file"; then
         log_error "Nonfree is enabled! This build is NOT App Store compliant!"
         return 1
     fi
