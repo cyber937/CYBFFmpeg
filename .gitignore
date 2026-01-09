@@ -44,3 +44,4 @@ ffmpeg-build/*.log
 .env.local
 
 samples/
+CLAUDE.md
