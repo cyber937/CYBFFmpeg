@@ -430,10 +430,16 @@ verify_lgpl() {
         return 1
     fi
 
-    # Check for banned libraries
-    local banned_libs=("libx264" "libx265" "libxvid" "libfdk" "libfaac")
+    # Check for banned (GPL / nonfree) libraries.
+    # config.mak uses two prefixes: a bare `CONFIG_FOO=yes` line means the
+    # option is ENABLED, while `!CONFIG_FOO=yes` means it was checked and
+    # is DISABLED. Earlier this loop ran a non-anchored case-insensitive
+    # grep ("libx264=yes") which falsely matched the `!CONFIG_LIBX264=yes`
+    # disabled-marker lines and aborted the build. Anchor at line start
+    # with the `CONFIG_` prefix so only the *enabled* lines match.
+    local banned_libs=("LIBX264" "LIBX265" "LIBXVID" "LIBFDK_AAC" "LIBFAAC")
     for lib in "${banned_libs[@]}"; do
-        if grep -qi "${lib}=yes" "$config_file"; then
+        if grep -q "^CONFIG_${lib}=yes" "$config_file"; then
             log_error "Banned library found: ${lib}"
             return 1
         fi
