@@ -18,8 +18,19 @@ default = ["videotoolbox"]
 videotoolbox = []
 
 [dependencies]
-# FFmpeg bindings - version 8.0 for FFmpeg 7.x/8.x compatibility
-ffmpeg-next = { version = "8.0", default-features = false, features = [
+# FFmpeg bindings — pinned to 7.1 series for FFmpeg 7.1.x compatibility.
+#
+# DECISION (2026-05-01): Stay on the 7.1 line for stability.
+# - NexClip uses MXF demuxer + H.264 (VideoToolbox) + ProRes / DNxHD/HR + AAC /
+#   PCM, all available in FFmpeg 7.1
+# - 8.x adds VVC encoder, Vulkan H.264/HEVC, WHIP, APV — none required here
+# - 8.0.1 + ffmpeg-next 8.0.0 hit non-exhaustive enum match errors
+#   (`AV_PKT_DATA_EXIF`, `AV_CODEC_ID_IVTV_VBI`)
+# - 7.1 is an LTS candidate with long-term security updates
+#
+# Do NOT bump to 8.x without revisiting the decision in
+# docs/planning/mxf-codec-support.md (kirinuki-ai repo).
+ffmpeg-next = { version = "7.1", default-features = false, features = [
     "codec",
     "format",
     "software-scaling",

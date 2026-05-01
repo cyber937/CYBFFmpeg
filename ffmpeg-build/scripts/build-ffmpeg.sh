@@ -29,8 +29,14 @@
 
 set -e
 
-# Configuration
-FFMPEG_VERSION="8.0.1"
+# Configuration.
+#
+# DECISION (2026-05-01): Pinned to the 7.1 series. See:
+#   - docs/planning/mxf-codec-support.md (kirinuki-ai)
+#   - cyb-ffmpeg-core/Cargo.toml (paired pin on ffmpeg-next 7.1)
+# 8.0.1 + ffmpeg-next 8.0.0 hit non-exhaustive enum match errors
+# (`AV_PKT_DATA_EXIF`). 7.1 covers all features NexClip needs.
+FFMPEG_VERSION="7.1.2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/../build"
 OUTPUT_DIR="${SCRIPT_DIR}/../output"
@@ -390,10 +396,11 @@ verify_lgpl() {
         return 1
     fi
 
-    # Check that GPL is NOT enabled
-    # In FFmpeg 8.x, disabled options are prefixed with "!"
-    # So "!CONFIG_GPL=yes" means GPL is DISABLED (which is what we want)
-    # We need to check for "CONFIG_GPL=yes" WITHOUT the "!" prefix
+    # Check that GPL is NOT enabled.
+    # FFmpeg 7.x writes `CONFIG_GPL=yes` only when GPL is enabled (absent
+    # otherwise). FFmpeg 8.x additionally writes `!CONFIG_GPL=yes` when
+    # disabled. We check for the line WITHOUT the leading "!" so the test
+    # works on both 7.x and 8.x.
     if grep -q "^CONFIG_GPL=yes" "$config_file"; then
         log_error "GPL is enabled! This build is NOT App Store compliant!"
         return 1
