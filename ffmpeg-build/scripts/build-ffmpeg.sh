@@ -181,6 +181,20 @@ configure_ffmpeg() {
         --disable-libxcb-xfixes
         --disable-libxcb-shape
 
+        # Disable SDL2 — Homebrew's sdl2 has a transitive libX11 dependency
+        # which leaks /opt/homebrew/opt/libx11/lib/libX11.6.dylib into every
+        # FFmpeg dylib. NexClip uses VideoToolbox / AppKit / CoreImage for
+        # rendering, never SDL2.
+        --disable-sdl2
+
+        # Defense in depth: explicitly disable anything else that could
+        # transitively pull X11 from Homebrew. None of these are used by
+        # NexClip, and FFmpeg's configure happily auto-enables them when
+        # pkg-config sees the Homebrew formulas.
+        --disable-libdrm
+        --disable-vaapi
+        --disable-vdpau
+
         # Enable Apple hardware acceleration (system frameworks = allowed)
         --enable-videotoolbox
         --enable-audiotoolbox
