@@ -356,6 +356,39 @@ install_ffmpeg() {
         fi
     done
 
+    # Fix pkg-config files. Two issues to address:
+    #
+    # 1. With PKG_CONFIG_LIBDIR= unset during configure, FFmpeg writes .pc
+    #    files with `prefix=` empty, leaving `libdir=/lib` and
+    #    `includedir=/include` pointing at non-existent system paths.
+    #
+    # 2. If $OUTPUT_DIR contains spaces (e.g. ".../Swift Packages/..."),
+    #    pkg-config's output gets word-split by downstream consumers
+    #    (notably pkg-config-rs in ffmpeg-sys-next's bindgen step), which
+    #    truncates `-L` flags at the first space. Standard remedy: write
+    #    the .pc files with backslash-escaped spaces so pkg-config returns
+    #    properly-escaped output that consumers re-assemble correctly.
+    #
+    # Done via Python instead of sed because BSD sed's replacement string
+    # silently strips backslashes, even when double-escaped at the bash
+    # level. Python's re.sub treats the replacement as a plain string
+    # (with explicit r'\ ' escaping) which round-trips reliably.
+    log_info "Fixing pkg-config prefix in .pc files..."
+    /usr/bin/env python3 - "$OUTPUT_DIR" "${OUTPUT_DIR}"/lib/pkgconfig/*.pc <<'PYEOF'
+import re, sys
+prefix = sys.argv[1]
+escaped = prefix.replace(' ', r'\ ')
+for pc in sys.argv[2:]:
+    with open(pc) as f:
+        content = f.read()
+    content = re.sub(r'^prefix=.*$', f'prefix={escaped}', content, flags=re.MULTILINE)
+    content = re.sub(r'^libdir=.*$', f'libdir={escaped}/lib', content, flags=re.MULTILINE)
+    content = re.sub(r'^includedir=.*$', f'includedir={escaped}/include', content, flags=re.MULTILINE)
+    with open(pc, 'w') as f:
+        f.write(content)
+    print(f"  Fixed: {pc.split('/')[-1]}")
+PYEOF
+
     # Fix inter-library dependencies
     for dylib in "${OUTPUT_DIR}"/lib/*.dylib; do
         if [ -f "$dylib" ] && [ ! -L "$dylib" ]; then
