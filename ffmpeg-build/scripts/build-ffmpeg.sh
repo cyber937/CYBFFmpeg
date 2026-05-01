@@ -29,8 +29,14 @@
 
 set -e
 
-# Configuration
-FFMPEG_VERSION="8.0.1"
+# Configuration.
+#
+# DECISION (2026-05-01): Pinned to the 7.1 series. See:
+#   - docs/planning/mxf-codec-support.md (kirinuki-ai)
+#   - cyb-ffmpeg-core/Cargo.toml (paired pin on ffmpeg-next 7.1)
+# 8.0.1 + ffmpeg-next 8.0.0 hit non-exhaustive enum match errors
+# (`AV_PKT_DATA_EXIF`). 7.1 covers all features NexClip needs.
+FFMPEG_VERSION="7.1.2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/../build"
 OUTPUT_DIR="${SCRIPT_DIR}/../output"
@@ -175,6 +181,20 @@ configure_ffmpeg() {
         --disable-libxcb-xfixes
         --disable-libxcb-shape
 
+        # Disable SDL2 — Homebrew's sdl2 has a transitive libX11 dependency
+        # which leaks /opt/homebrew/opt/libx11/lib/libX11.6.dylib into every
+        # FFmpeg dylib. NexClip uses VideoToolbox / AppKit / CoreImage for
+        # rendering, never SDL2.
+        --disable-sdl2
+
+        # Defense in depth: explicitly disable anything else that could
+        # transitively pull X11 from Homebrew. None of these are used by
+        # NexClip, and FFmpeg's configure happily auto-enables them when
+        # pkg-config sees the Homebrew formulas.
+        --disable-libdrm
+        --disable-vaapi
+        --disable-vdpau
+
         # Enable Apple hardware acceleration (system frameworks = allowed)
         --enable-videotoolbox
         --enable-audiotoolbox
@@ -293,12 +313,16 @@ configure_ffmpeg() {
         )
     fi
 
-    # Run configure with an explicitly empty PKG_CONFIG_PATH so FFmpeg
-    # cannot pick up Homebrew (or any other) external libraries at
-    # auto-detection time. Combined with the explicit --disable-libxcb*
-    # and --disable-libvpx/--disable-libdav1d defaults, this guarantees
-    # the produced dylibs only depend on system frameworks.
-    PKG_CONFIG_PATH= ./configure "${CONFIGURE_OPTIONS[@]}"
+    # Run configure with an explicitly empty pkg-config search path so
+    # FFmpeg cannot pick up Homebrew (or any other) external libraries at
+    # auto-detection time. PKG_CONFIG_PATH= alone is NOT enough on Homebrew
+    # systems — pkg-config has compile-time-default search paths
+    # (/opt/homebrew/lib/pkgconfig and /opt/homebrew/share/pkgconfig) that
+    # are only suppressed by also setting PKG_CONFIG_LIBDIR=. Without both,
+    # FFmpeg leaks `-L/opt/homebrew/Cellar/libx11/.../lib -lX11` into
+    # libavutil.pc's Libs.private, which the dylibs then carry as a hard
+    # dependency.
+    PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR= ./configure "${CONFIGURE_OPTIONS[@]}"
 
     log_info "FFmpeg configured successfully"
 }
@@ -331,6 +355,39 @@ install_ffmpeg() {
             log_info "Fixed: ${name}"
         fi
     done
+
+    # Fix pkg-config files. Two issues to address:
+    #
+    # 1. With PKG_CONFIG_LIBDIR= unset during configure, FFmpeg writes .pc
+    #    files with `prefix=` empty, leaving `libdir=/lib` and
+    #    `includedir=/include` pointing at non-existent system paths.
+    #
+    # 2. If $OUTPUT_DIR contains spaces (e.g. ".../Swift Packages/..."),
+    #    pkg-config's output gets word-split by downstream consumers
+    #    (notably pkg-config-rs in ffmpeg-sys-next's bindgen step), which
+    #    truncates `-L` flags at the first space. Standard remedy: write
+    #    the .pc files with backslash-escaped spaces so pkg-config returns
+    #    properly-escaped output that consumers re-assemble correctly.
+    #
+    # Done via Python instead of sed because BSD sed's replacement string
+    # silently strips backslashes, even when double-escaped at the bash
+    # level. Python's re.sub treats the replacement as a plain string
+    # (with explicit r'\ ' escaping) which round-trips reliably.
+    log_info "Fixing pkg-config prefix in .pc files..."
+    /usr/bin/env python3 - "$OUTPUT_DIR" "${OUTPUT_DIR}"/lib/pkgconfig/*.pc <<'PYEOF'
+import re, sys
+prefix = sys.argv[1]
+escaped = prefix.replace(' ', r'\ ')
+for pc in sys.argv[2:]:
+    with open(pc) as f:
+        content = f.read()
+    content = re.sub(r'^prefix=.*$', f'prefix={escaped}', content, flags=re.MULTILINE)
+    content = re.sub(r'^libdir=.*$', f'libdir={escaped}/lib', content, flags=re.MULTILINE)
+    content = re.sub(r'^includedir=.*$', f'includedir={escaped}/include', content, flags=re.MULTILINE)
+    with open(pc, 'w') as f:
+        f.write(content)
+    print(f"  Fixed: {pc.split('/')[-1]}")
+PYEOF
 
     # Fix inter-library dependencies
     for dylib in "${OUTPUT_DIR}"/lib/*.dylib; do
@@ -390,10 +447,11 @@ verify_lgpl() {
         return 1
     fi
 
-    # Check that GPL is NOT enabled
-    # In FFmpeg 8.x, disabled options are prefixed with "!"
-    # So "!CONFIG_GPL=yes" means GPL is DISABLED (which is what we want)
-    # We need to check for "CONFIG_GPL=yes" WITHOUT the "!" prefix
+    # Check that GPL is NOT enabled.
+    # FFmpeg 7.x writes `CONFIG_GPL=yes` only when GPL is enabled (absent
+    # otherwise). FFmpeg 8.x additionally writes `!CONFIG_GPL=yes` when
+    # disabled. We check for the line WITHOUT the leading "!" so the test
+    # works on both 7.x and 8.x.
     if grep -q "^CONFIG_GPL=yes" "$config_file"; then
         log_error "GPL is enabled! This build is NOT App Store compliant!"
         return 1
@@ -405,10 +463,16 @@ verify_lgpl() {
         return 1
     fi
 
-    # Check for banned libraries
-    local banned_libs=("libx264" "libx265" "libxvid" "libfdk" "libfaac")
+    # Check for banned (GPL / nonfree) libraries.
+    # config.mak uses two prefixes: a bare `CONFIG_FOO=yes` line means the
+    # option is ENABLED, while `!CONFIG_FOO=yes` means it was checked and
+    # is DISABLED. Earlier this loop ran a non-anchored case-insensitive
+    # grep ("libx264=yes") which falsely matched the `!CONFIG_LIBX264=yes`
+    # disabled-marker lines and aborted the build. Anchor at line start
+    # with the `CONFIG_` prefix so only the *enabled* lines match.
+    local banned_libs=("LIBX264" "LIBX265" "LIBXVID" "LIBFDK_AAC" "LIBFAAC")
     for lib in "${banned_libs[@]}"; do
-        if grep -qi "${lib}=yes" "$config_file"; then
+        if grep -q "^CONFIG_${lib}=yes" "$config_file"; then
             log_error "Banned library found: ${lib}"
             return 1
         fi

@@ -47,7 +47,7 @@ CYBFFmpeg provides video decoding support for codecs not available in AVFoundati
 - Rust 1.70+
 - Build tools: `pkg-config`, `nasm` (via Homebrew)
 
-The package builds FFmpeg 8.0.1 from source as part of `./build-all.sh`. The
+The package builds FFmpeg 7.1.x from source as part of `./build-all.sh`. The
 produced dylibs are LGPL v3.0 only (no GPL components) and self-contained
 (no `/opt/homebrew/...` absolute path dependencies) so they can be embedded
 in a sandboxed Mac App Store app and re-signed with the consumer app's
