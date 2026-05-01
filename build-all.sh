@@ -90,6 +90,12 @@ if [ "$SKIP_RUST" = false ]; then
     export PKG_CONFIG_PATH_FOR_TARGET="$LOCAL_PC"
     export PKG_CONFIG_LIBDIR="$LOCAL_PC"
 
+    # Match CYBFFmpeg's Package.swift `.macOS(.v14)` and the FFmpeg build
+    # above. Without this, cargo would fall back to the host SDK's min
+    # (e.g. 26.0 on Tahoe-beta) and the static lib would carry an
+    # LC_BUILD_VERSION incompatible with consumer apps targeting 14.x.
+    export MACOSX_DEPLOYMENT_TARGET="14.0"
+
     if [ "$DEBUG_BUILD" = true ]; then
         cargo build
         echo "Built debug: target/debug/libcyb_ffmpeg_core.a"

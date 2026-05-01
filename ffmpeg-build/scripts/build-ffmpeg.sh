@@ -37,6 +37,17 @@ set -e
 # 8.0.1 + ffmpeg-next 8.0.0 hit non-exhaustive enum match errors
 # (`AV_PKT_DATA_EXIF`). 7.1 covers all features NexClip needs.
 FFMPEG_VERSION="7.1.2"
+
+# Match CYBFFmpeg's Package.swift `.macOS(.v14)` so the produced dylibs
+# carry an LC_BUILD_VERSION compatible with consumer apps targeting
+# macOS 14.0. Without this, FFmpeg's configure detects the host SDK's
+# minimum (e.g. macOS 26.0 on a Tahoe-beta machine) and embeds that as
+# the dylib's minOS, which makes the linker on consumer apps emit
+# "Building for macOS-14.x, but linking with dylib... which was built
+# for newer version 26.0" warnings and may crash at runtime if 26.0-only
+# symbols are used. Override it here so the build is reproducible
+# regardless of the host SDK version.
+export MACOSX_DEPLOYMENT_TARGET="14.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/../build"
 OUTPUT_DIR="${SCRIPT_DIR}/../output"
@@ -205,6 +216,12 @@ configure_ffmpeg() {
         # macOS specific
         --enable-cross-compile
         --target-os=darwin
+
+        # Pass the deployment target to both the C compiler and the linker
+        # so every produced .o / .dylib carries an LC_BUILD_VERSION of 14.0
+        # rather than the host SDK's default (e.g. 26.0 on Tahoe-beta).
+        --extra-cflags=-mmacosx-version-min=14.0
+        --extra-ldflags=-mmacosx-version-min=14.0
 
         # Disable unnecessary components
         --disable-programs       # No ffmpeg/ffprobe binaries
