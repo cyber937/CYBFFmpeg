@@ -45,15 +45,25 @@ CYBFFmpeg provides video decoding support for codecs not available in AVFoundati
 - macOS 14.0+
 - Xcode 15.0+
 - Rust 1.70+
-- FFmpeg 7.x or 8.x (via Homebrew)
+- Build tools: `pkg-config`, `nasm` (via Homebrew)
+
+The package builds FFmpeg 8.0.1 from source as part of `./build-all.sh`. The
+produced dylibs are LGPL v3.0 only (no GPL components) and self-contained
+(no `/opt/homebrew/...` absolute path dependencies) so they can be embedded
+in a sandboxed Mac App Store app and re-signed with the consumer app's
+Team ID for library validation compliance.
+
+External codec libraries (libvpx, libdav1d, …) are intentionally **not**
+linked. VP9 and AV1 fall back to VideoToolbox hardware decode on Apple
+Silicon — see `ffmpeg-build/scripts/build-ffmpeg.sh` for the codec matrix.
 
 ## Installation
 
 ### Prerequisites
 
-1. Install FFmpeg:
+1. Install build tools:
 ```bash
-brew install ffmpeg
+brew install pkg-config nasm
 ```
 
 2. Install Rust:
@@ -61,12 +71,22 @@ brew install ffmpeg
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-### Building the Rust Core
+### Building the binary artifacts (first run: 30–60 minutes)
+
+`libcyb_ffmpeg_core.a` (Rust) and the FFmpeg `lib*.dylib` are gitignored.
+After cloning, run the top-level orchestrator once to produce them:
 
 ```bash
-cd cyb-ffmpeg-core
-cargo build --release
+./build-all.sh           # release build of both Rust core and FFmpeg
+./build-all.sh --clean   # clean rebuild
+./build-all.sh --debug   # debug build
+./build-all.sh --skip-ffmpeg   # rebuild only the Rust core
 ```
+
+The script verifies that produced dylibs have no external path dependencies
+(Homebrew / /usr/local / /opt) and that GPL / nonfree codecs are disabled.
+Subsequent runs (no `--clean`) take a few seconds because the FFmpeg source
+tarball stays cached under `ffmpeg-build/build/`.
 
 ### Adding to Your Project
 

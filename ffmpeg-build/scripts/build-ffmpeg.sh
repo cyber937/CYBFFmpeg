@@ -4,16 +4,23 @@
 # =============================================================================
 # This script builds FFmpeg with LGPL-only components for Mac App Store
 # distribution. NO GPL components (libx264, libx265, etc.) are included.
+# All produced dylibs are self-contained (no Homebrew or external paths).
 #
-# Supported codecs:
-# - VP9 (libvpx) - BSD license
-# - AV1 (libdav1d) - BSD-2-Clause license
+# Supported codecs (LGPL native + system frameworks only):
 # - MPEG-1/2/4 - Native LGPL
 # - DNxHD/HR - Native LGPL
 # - H.264/HEVC - VideoToolbox (Apple system framework)
+# - VP9 - VideoToolbox HW decode on Apple Silicon (no software fallback)
+# - AV1 - VideoToolbox HW decode on M3+ (no software fallback)
+# - ProRes - Native LGPL
 # - WMV1/2/3/VC-1 - Native LGPL (Windows Media Video)
 # - WMA - Native LGPL (Windows Media Audio)
 # - AC-3/E-AC-3 - Native LGPL (Dolby Digital)
+#
+# External libraries (libvpx, libdav1d, etc.) are intentionally NOT linked.
+# This keeps the dylibs free of /opt/homebrew/... absolute path dependencies
+# so they can be embedded into a sandboxed Mac App Store app and re-signed
+# with the consumer app's Team ID for library validation compliance.
 #
 # Usage:
 #   ./build-ffmpeg.sh [--clean] [--debug]
@@ -90,23 +97,17 @@ else
     log_info "Building for Intel (x86_64)"
 fi
 
-# Check for Homebrew dependencies
+# Check for build tools (only nasm + pkg-config). External codec libraries
+# are intentionally not linked — see header for rationale.
 check_dependencies() {
     log_info "Checking dependencies..."
 
     local missing_deps=()
 
-    # Required tools
+    # Required build tools
     for tool in pkg-config nasm; do
         if ! command -v "$tool" &> /dev/null; then
             missing_deps+=("$tool")
-        fi
-    done
-
-    # LGPL-safe codec libraries
-    for lib in libvpx dav1d; do
-        if ! pkg-config --exists "$lib" 2>/dev/null; then
-            missing_deps+=("$lib")
         fi
     done
 
@@ -160,9 +161,19 @@ configure_ffmpeg() {
         --disable-libxvid
         --disable-libfdk-aac
 
-        # Enable LGPL-safe external libraries
-        --enable-libvpx          # VP9 - BSD license
-        --enable-libdav1d        # AV1 - BSD-2-Clause
+        # External codec libraries are intentionally NOT linked.
+        # libvpx (VP9) and libdav1d (AV1) would pull in /opt/homebrew/...
+        # absolute path dependencies that App Store sandbox + library
+        # validation reject. VP9 / AV1 fall back to VideoToolbox HW decode
+        # on Apple Silicon. See header for codec support matrix.
+
+        # Disable X11 / xcb auto-detection (FFmpeg's configure may detect
+        # them from Homebrew via libdav1d's transitive deps even when we
+        # don't explicitly enable them).
+        --disable-libxcb
+        --disable-libxcb-shm
+        --disable-libxcb-xfixes
+        --disable-libxcb-shape
 
         # Enable Apple hardware acceleration (system frameworks = allowed)
         --enable-videotoolbox
@@ -221,10 +232,8 @@ configure_ffmpeg() {
         # Enable LGPL decoders
         --enable-decoder=h264
         --enable-decoder=hevc
-        --enable-decoder=vp9
-        --enable-decoder=av1
-        --enable-decoder=libvpx_vp9
-        --enable-decoder=libdav1d
+        --enable-decoder=vp9          # FFmpeg native software decoder (slow on M1)
+        --enable-decoder=av1          # FFmpeg native software decoder (slow without dav1d)
         --enable-decoder=mpeg1video
         --enable-decoder=mpeg2video
         --enable-decoder=mpeg4
@@ -284,8 +293,12 @@ configure_ffmpeg() {
         )
     fi
 
-    # Run configure
-    ./configure "${CONFIGURE_OPTIONS[@]}"
+    # Run configure with an explicitly empty PKG_CONFIG_PATH so FFmpeg
+    # cannot pick up Homebrew (or any other) external libraries at
+    # auto-detection time. Combined with the explicit --disable-libxcb*
+    # and --disable-libvpx/--disable-libdav1d defaults, this guarantees
+    # the produced dylibs only depend on system frameworks.
+    PKG_CONFIG_PATH= ./configure "${CONFIGURE_OPTIONS[@]}"
 
     log_info "FFmpeg configured successfully"
 }
@@ -334,6 +347,36 @@ install_ffmpeg() {
     done
 
     log_info "FFmpeg installed successfully"
+}
+
+# Verify produced dylibs are self-contained — they must not depend on any
+# path outside /usr/lib (system) or @rpath (bundled). Catches Homebrew /
+# /opt/local / /usr/local leakage that would break App Store distribution.
+verify_self_contained() {
+    log_info "Verifying dylibs have no external path dependencies..."
+
+    local violations=0
+    for dylib in "${OUTPUT_DIR}"/lib/*.dylib; do
+        if [ -f "$dylib" ] && [ ! -L "$dylib" ]; then
+            local bad_deps
+            bad_deps=$(otool -L "$dylib" | tail -n +2 | awk '{print $1}' | \
+                grep -E '^(/opt/|/usr/local/|/Users/|/Library/|/Volumes/)' || true)
+            if [ -n "$bad_deps" ]; then
+                log_error "$(basename "$dylib") has external path dependencies:"
+                echo "$bad_deps" | sed 's/^/    /'
+                violations=$((violations + 1))
+            fi
+        fi
+    done
+
+    if [ "$violations" -gt 0 ]; then
+        log_error "Found $violations dylib(s) with external path dependencies."
+        log_error "App Store distribution requires self-contained dylibs."
+        return 1
+    fi
+
+    log_info "✓ All dylibs are self-contained"
+    return 0
 }
 
 # Verify LGPL compliance
@@ -407,6 +450,7 @@ main() {
     configure_ffmpeg
     build_ffmpeg
     install_ffmpeg
+    verify_self_contained
     verify_lgpl
     print_summary
 }
