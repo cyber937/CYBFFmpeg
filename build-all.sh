@@ -3,11 +3,18 @@
 # CYBFFmpeg — top-level build orchestrator
 # =============================================================================
 # Builds the two artifacts CYBFFmpeg ships out of source:
-#   1. cyb-ffmpeg-core/target/release/libcyb_ffmpeg_core.a (Rust static lib)
-#   2. ffmpeg-build/output/lib/lib*.dylib                  (FFmpeg dynamic libs)
+#   1. ffmpeg-build/output/lib/lib*.dylib                  (FFmpeg dynamic libs)
+#   2. cyb-ffmpeg-core/target/release/libcyb_ffmpeg_core.a (Rust static lib)
 #
 # Both are gitignored. Consumers (e.g. CYBFFmpegDecoder, kirinuki-ai) link
 # against them via paths set in CYBFFmpeg's Package.swift.
+#
+# Build order matters: FFmpeg must be built *first* because the Rust crate
+# `ffmpeg-sys-next` runs bindgen against the FFmpeg headers. We point its
+# pkg-config at our locally built FFmpeg so the Rust core links against the
+# same LGPL-clean libraries we ship in the dylibs — not whatever Homebrew
+# happens to have installed (which could be GPL-tainted, the wrong major
+# version, or absent).
 #
 # Usage:
 #   ./build-all.sh [--clean] [--debug] [--skip-rust] [--skip-ffmpeg]
@@ -44,26 +51,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# ---- Rust core ---------------------------------------------------------------
-if [ "$SKIP_RUST" = false ]; then
-    echo ""
-    echo "============================================="
-    echo "Building cyb-ffmpeg-core (Rust static lib)"
-    echo "============================================="
-    cd "$SCRIPT_DIR/cyb-ffmpeg-core"
-    if [ "$CLEAN_BUILD" = true ]; then
-        cargo clean
-    fi
-    if [ "$DEBUG_BUILD" = true ]; then
-        cargo build
-        echo "Built debug: target/debug/libcyb_ffmpeg_core.a"
-    else
-        cargo build --release
-        echo "Built release: target/release/libcyb_ffmpeg_core.a"
-    fi
-fi
-
-# ---- FFmpeg LGPL build -------------------------------------------------------
+# ---- FFmpeg LGPL build (must run first — Rust depends on its headers) -------
 if [ "$SKIP_FFMPEG" = false ]; then
     echo ""
     echo "============================================="
@@ -74,6 +62,41 @@ if [ "$SKIP_FFMPEG" = false ]; then
     [ "$CLEAN_BUILD" = true ] && FFMPEG_ARGS+=(--clean)
     [ "$DEBUG_BUILD" = true ] && FFMPEG_ARGS+=(--debug)
     ./build-ffmpeg.sh "${FFMPEG_ARGS[@]}"
+fi
+
+# ---- Rust core ---------------------------------------------------------------
+if [ "$SKIP_RUST" = false ]; then
+    echo ""
+    echo "============================================="
+    echo "Building cyb-ffmpeg-core (Rust static lib)"
+    echo "============================================="
+    cd "$SCRIPT_DIR/cyb-ffmpeg-core"
+    if [ "$CLEAN_BUILD" = true ]; then
+        cargo clean
+    fi
+
+    # Point ffmpeg-sys-next at our locally built FFmpeg, *exclusively*. Empty
+    # PKG_CONFIG_PATH_DEFAULT plus a single explicit PKG_CONFIG_PATH entry
+    # prevents pkg-config from falling back to Homebrew (which would otherwise
+    # supply a different major version and break bindgen + ffmpeg-next's
+    # version-gated `match` arms).
+    LOCAL_PC="$SCRIPT_DIR/ffmpeg-build/output/lib/pkgconfig"
+    if [ ! -d "$LOCAL_PC" ]; then
+        echo "Error: $LOCAL_PC not found — did you run build-ffmpeg.sh first?" >&2
+        echo "Re-run without --skip-ffmpeg or build-ffmpeg.sh manually." >&2
+        exit 1
+    fi
+    export PKG_CONFIG_PATH="$LOCAL_PC"
+    export PKG_CONFIG_PATH_FOR_TARGET="$LOCAL_PC"
+    export PKG_CONFIG_LIBDIR="$LOCAL_PC"
+
+    if [ "$DEBUG_BUILD" = true ]; then
+        cargo build
+        echo "Built debug: target/debug/libcyb_ffmpeg_core.a"
+    else
+        cargo build --release
+        echo "Built release: target/release/libcyb_ffmpeg_core.a"
+    fi
 fi
 
 echo ""
