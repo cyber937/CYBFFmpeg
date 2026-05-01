@@ -313,12 +313,16 @@ configure_ffmpeg() {
         )
     fi
 
-    # Run configure with an explicitly empty PKG_CONFIG_PATH so FFmpeg
-    # cannot pick up Homebrew (or any other) external libraries at
-    # auto-detection time. Combined with the explicit --disable-libxcb*
-    # and --disable-libvpx/--disable-libdav1d defaults, this guarantees
-    # the produced dylibs only depend on system frameworks.
-    PKG_CONFIG_PATH= ./configure "${CONFIGURE_OPTIONS[@]}"
+    # Run configure with an explicitly empty pkg-config search path so
+    # FFmpeg cannot pick up Homebrew (or any other) external libraries at
+    # auto-detection time. PKG_CONFIG_PATH= alone is NOT enough on Homebrew
+    # systems — pkg-config has compile-time-default search paths
+    # (/opt/homebrew/lib/pkgconfig and /opt/homebrew/share/pkgconfig) that
+    # are only suppressed by also setting PKG_CONFIG_LIBDIR=. Without both,
+    # FFmpeg leaks `-L/opt/homebrew/Cellar/libx11/.../lib -lX11` into
+    # libavutil.pc's Libs.private, which the dylibs then carry as a hard
+    # dependency.
+    PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR= ./configure "${CONFIGURE_OPTIONS[@]}"
 
     log_info "FFmpeg configured successfully"
 }
