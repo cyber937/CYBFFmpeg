@@ -465,7 +465,7 @@ pub extern "C" fn cyb_decoder_clear_cache(handle: *mut CybDecoderHandle) -> CybR
 /// Video frame data for FFI
 #[repr(C)]
 pub struct CybVideoFrame {
-    /// Raw pixel data pointer
+    /// Raw pixel data pointer (null when `cv_pixel_buffer_ptr != 0`)
     pub data: *const u8,
     /// Data size in bytes
     pub data_size: usize,
@@ -485,6 +485,9 @@ pub struct CybVideoFrame {
     pub frame_number: i64,
     /// Pixel format (0=BGRA, 1=NV12, 2=YUV420P)
     pub pixel_format: u8,
+    /// CVPixelBufferRef for VideoToolbox HW-decoded frames (0 = SW path).
+    /// Caller takes ownership of one CFRetain.
+    pub cv_pixel_buffer_ptr: u64,
 }
 
 /// Opaque frame handle (owns the data)
@@ -590,6 +593,7 @@ pub extern "C" fn cyb_frame_get_data(
         (*out_frame).is_keyframe = frame.is_keyframe;
         (*out_frame).frame_number = frame.frame_number;
         (*out_frame).pixel_format = frame.pixel_format as u8;
+        (*out_frame).cv_pixel_buffer_ptr = frame.cv_pixel_buffer_ptr;
     }
 }
 

@@ -66,7 +66,7 @@ typedef struct CybCacheStats {
 
 // Video frame data for FFI
 typedef struct CybVideoFrame {
-    // Raw pixel data pointer
+    // Raw pixel data pointer (NULL when cv_pixel_buffer_ptr != 0)
     const uint8_t *data;
     // Data size in bytes
     uintptr_t data_size;
@@ -86,6 +86,9 @@ typedef struct CybVideoFrame {
     int64_t frame_number;
     // Pixel format (0=BGRA, 1=NV12, 2=YUV420P)
     uint8_t pixel_format;
+    // CVPixelBufferRef for VideoToolbox HW-decoded frames (0 = SW path).
+    // Caller takes ownership of one CFRetain.
+    uint64_t cv_pixel_buffer_ptr;
 } CybVideoFrame;
 
 // Media info for FFI

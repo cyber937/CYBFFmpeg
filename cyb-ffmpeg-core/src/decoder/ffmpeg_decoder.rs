@@ -21,6 +21,12 @@ use super::frame::VideoFrame;
 use super::info::{AudioTrack, CodecInfo, MediaInfo, VideoTrack};
 use crate::error::{Error, Result};
 
+// CoreFoundation retain — used by the VideoToolbox HW path so the Swift
+// consumer can take ownership of the CVPixelBuffer (which is a CFTypeRef).
+extern "C" {
+    fn CFRetain(cf: *const std::ffi::c_void) -> *const std::ffi::c_void;
+}
+
 /// FFmpeg decoder context
 pub struct FFmpegContext {
     /// Input format context
@@ -85,6 +91,12 @@ pub struct FFmpegContext {
 
     /// Prefer hardware decoding
     prefer_hw: bool,
+
+    /// Set when the open video decoder is `h264_videotoolbox` (or another
+    /// VT decoder). Frames come out in `AV_PIX_FMT_VIDEOTOOLBOX` format
+    /// with `frame.data[3]` carrying a `CVPixelBufferRef` — we hand that
+    /// pointer through the FFI instead of running SWS / Vec copies.
+    is_hw_decoder: bool,
 
     /// Queue of audio packets collected during video decoding
     audio_packet_queue: VecDeque<ffmpeg::Packet>,
@@ -232,6 +244,7 @@ impl FFmpegContext {
             audio_sample_rate: 0,
             audio_channels: 0,
             prefer_hw: config.prefer_hardware_decoding,
+            is_hw_decoder: false,
             audio_packet_queue: VecDeque::with_capacity(64),
             video_packet_queue: VecDeque::with_capacity(32),
             keyframe_index: None,
@@ -413,10 +426,43 @@ impl FFmpegContext {
             }
         }
 
-        // Find decoder
-        let decoder_codec = ffmpeg::decoder::find(codec_params.id()).ok_or_else(|| {
-            Error::CodecNotSupported(format!("No decoder for codec: {:?}", codec_params.id()))
-        })?;
+        // Find decoder. Prefer the standalone VideoToolbox HW decoder for
+        // codecs that support it — frames come out as CVPixelBuffer
+        // (`AV_PIX_FMT_VIDEOTOOLBOX`) so we skip SWS + the per-frame Vec
+        // copy across the FFI. Falls back to the regular SW decoder when
+        // the HW decoder isn't built into libavcodec at runtime.
+        let codec_id = codec_params.id();
+        let hw_decoder_name = if config.prefer_hardware_decoding {
+            match codec_id {
+                ffmpeg::codec::Id::H264 => Some("h264_videotoolbox"),
+                ffmpeg::codec::Id::HEVC => Some("hevc_videotoolbox"),
+                ffmpeg::codec::Id::PRORES => Some("prores_videotoolbox"),
+                ffmpeg::codec::Id::VP9 => Some("vp9_videotoolbox"),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let (decoder_codec, used_hw) = if let Some(name) = hw_decoder_name {
+            if let Some(hw) = ffmpeg::decoder::find_by_name(name) {
+                log::info!("Using {} HW decoder", name);
+                (hw, true)
+            } else {
+                let sw = ffmpeg::decoder::find(codec_id).ok_or_else(|| {
+                    Error::CodecNotSupported(format!("No decoder for codec: {:?}", codec_id))
+                })?;
+                log::warn!("{} not available, falling back to SW decoder {}", name, sw.name());
+                (sw, false)
+            }
+        } else {
+            let sw = ffmpeg::decoder::find(codec_id).ok_or_else(|| {
+                Error::CodecNotSupported(format!("No decoder for codec: {:?}", codec_id))
+            })?;
+            (sw, false)
+        };
+
+        self.is_hw_decoder = used_hw;
 
         log::info!(
             "Using decoder: {} ({})",
@@ -574,28 +620,33 @@ impl FFmpegContext {
             self.duration_us as f64 / 1_000_000.0
         );
 
-        // Initialize scaler for pixel format conversion
-        let target_ffmpeg_format = Self::pixel_format_to_ffmpeg(self.target_format);
-        let source_format = video_decoder.format();
+        // Initialize scaler for pixel format conversion. HW-decoded frames
+        // come out as `AV_PIX_FMT_VIDEOTOOLBOX` (a hardware reference, not
+        // pixel data); SWS can't process them, and we don't need it to —
+        // the CVPixelBuffer flows straight through the FFI.
+        if !self.is_hw_decoder {
+            let target_ffmpeg_format = Self::pixel_format_to_ffmpeg(self.target_format);
+            let source_format = video_decoder.format();
 
-        if source_format != target_ffmpeg_format {
-            let scaler = ScalerContext::get(
-                source_format,
-                self.width,
-                self.height,
-                target_ffmpeg_format,
-                self.width,
-                self.height,
-                ScalerFlags::BILINEAR,
-            )
-            .map_err(|e| Error::DecodeFailed(format!("Failed to create scaler: {}", e)))?;
+            if source_format != target_ffmpeg_format {
+                let scaler = ScalerContext::get(
+                    source_format,
+                    self.width,
+                    self.height,
+                    target_ffmpeg_format,
+                    self.width,
+                    self.height,
+                    ScalerFlags::BILINEAR,
+                )
+                .map_err(|e| Error::DecodeFailed(format!("Failed to create scaler: {}", e)))?;
 
-            self.scaler = Some(scaler);
-            log::debug!(
-                "Scaler initialized: {:?} -> {:?}",
-                source_format,
-                target_ffmpeg_format
-            );
+                self.scaler = Some(scaler);
+                log::debug!(
+                    "Scaler initialized: {:?} -> {:?}",
+                    source_format,
+                    target_ffmpeg_format
+                );
+            }
         }
 
         self.video_decoder = Some(video_decoder);
@@ -1382,7 +1433,6 @@ impl FFmpegContext {
     fn create_video_frame_with_pts(&self, frame: &VideoFrameFFmpeg, pts: i64, is_keyframe: bool) -> Result<VideoFrame> {
         let width = frame.width();
         let height = frame.height();
-        let stride = frame.stride(0) as u32;
 
         // Calculate PTS in microseconds
         let pts_us = Self::pts_to_us(pts, self.video_time_base);
@@ -1393,6 +1443,39 @@ impl FFmpegContext {
         } else {
             16666 // Default to ~60fps
         };
+
+        // HW path: extract the CVPixelBuffer pointer from `frame.data[3]`,
+        // CFRetain it so the Swift consumer owns one reference, return a
+        // zero-copy VideoFrame. The original AVFrame's release will drop
+        // the decoder's own retain when this function returns.
+        if self.is_hw_decoder {
+            let cv_pixel_buffer_ptr = unsafe {
+                let av_frame_ptr = frame.as_ptr();
+                (*av_frame_ptr).data[3] as u64
+            };
+
+            if cv_pixel_buffer_ptr == 0 {
+                return Err(Error::DecodeFailed(
+                    "HW decoder produced frame without CVPixelBuffer".to_string(),
+                ));
+            }
+
+            unsafe {
+                CFRetain(cv_pixel_buffer_ptr as *const std::ffi::c_void);
+            }
+
+            return Ok(VideoFrame::new_hw(
+                cv_pixel_buffer_ptr,
+                width,
+                height,
+                pts_us,
+                frame_duration_us,
+                is_keyframe,
+                self.frame_number,
+            ));
+        }
+
+        let stride = frame.stride(0) as u32;
 
         // Copy pixel data
         let data = match self.target_format {
