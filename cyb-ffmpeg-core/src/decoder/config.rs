@@ -14,7 +14,10 @@ pub enum PixelFormat {
 
 impl Default for PixelFormat {
     fn default() -> Self {
-        Self::Bgra
+        // NV12 over BGRA: 12-bit vs 32-bit per pixel = 62% less memory
+        // bandwidth across the Rust→Swift FFI for 4K frames. yuv420p →
+        // NV12 in SWS is also lighter than yuv420p → BGRA.
+        Self::Nv12
     }
 }
 
@@ -52,7 +55,7 @@ impl Default for DecoderConfig {
             l3_cache_capacity: 500,
             enable_prefetch: true,
             thread_count: 0,
-            output_pixel_format: PixelFormat::Bgra,
+            output_pixel_format: PixelFormat::Nv12,
         }
     }
 }
@@ -67,7 +70,7 @@ impl DecoderConfig {
             l3_cache_capacity: 1000,
             enable_prefetch: true,
             thread_count: 0,
-            output_pixel_format: PixelFormat::Bgra,
+            output_pixel_format: PixelFormat::Nv12,
         }
     }
 
@@ -93,7 +96,7 @@ impl DecoderConfig {
             l3_cache_capacity: 800,
             enable_prefetch: true,
             thread_count: 0,
-            output_pixel_format: PixelFormat::Bgra,
+            output_pixel_format: PixelFormat::Nv12,
         }
     }
 }

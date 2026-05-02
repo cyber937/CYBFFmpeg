@@ -28,7 +28,7 @@ public struct DecoderConfiguration: Sendable {
         preferHardwareDecoding: Bool = true,
         cacheConfiguration: CacheConfiguration = .default,
         threadCount: Int = 0,
-        outputPixelFormat: PixelFormat = .bgra
+        outputPixelFormat: PixelFormat = .nv12
     ) {
         self.preferHardwareDecoding = preferHardwareDecoding
         self.cacheConfiguration = cacheConfiguration
@@ -46,7 +46,7 @@ public struct DecoderConfiguration: Sendable {
         preferHardwareDecoding: true,
         cacheConfiguration: .performance,
         threadCount: 0,
-        outputPixelFormat: .bgra
+        outputPixelFormat: .nv12
     )
 
     /// Low memory configuration with smaller caches
@@ -62,7 +62,7 @@ public struct DecoderConfiguration: Sendable {
         preferHardwareDecoding: true,
         cacheConfiguration: .scrubbing,
         threadCount: 0,
-        outputPixelFormat: .bgra
+        outputPixelFormat: .nv12
     )
 }
 
