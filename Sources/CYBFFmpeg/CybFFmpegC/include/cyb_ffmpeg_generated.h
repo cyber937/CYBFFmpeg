@@ -141,6 +141,8 @@ typedef struct CybAudioFrame {
 
 extern const void *CFRetain(const void *cf);
 
+extern void CFRelease(const void *cf);
+
 // Get last error message
  const char *cyb_get_last_error(void) ;
 
@@ -241,7 +243,14 @@ void cyb_frame_get_data(const struct CybFrameHandle *frame_handle,
                         struct CybVideoFrame *out_frame)
 ;
 
-// Release frame handle
+// Release frame handle.
+//
+// Swift consumes the `cv_pixel_buffer_ptr`'s `+1` retain via
+// `Unmanaged::takeRetainedValue()` in `cyb_frame_get_data`'s caller before
+// reaching this point. Zero the pointer here so `VideoFrame::drop` (which
+// would otherwise `CFRelease` the same retain) becomes a no-op for that
+// field. The cache holds clones with their own retains (added by `Clone`)
+// — those are released independently when the cache evicts them.
  void cyb_frame_release(struct CybFrameHandle *frame_handle) ;
 
 // Get media info

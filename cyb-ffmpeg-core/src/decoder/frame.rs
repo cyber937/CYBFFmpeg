@@ -2,8 +2,24 @@
 
 use super::config::PixelFormat;
 
-/// Decoded video frame
-#[derive(Clone)]
+// CoreFoundation FFI shared with `super::ffmpeg_decoder` (which uses
+// `CFRetain` on the HW-decode path). Declared here so the `Clone`/`Drop`
+// impls below can balance the retain count for `cv_pixel_buffer_ptr`.
+#[cfg(target_os = "macos")]
+extern "C" {
+    pub(super) fn CFRetain(cf: *const std::ffi::c_void) -> *const std::ffi::c_void;
+    pub(super) fn CFRelease(cf: *const std::ffi::c_void);
+}
+
+/// Decoded video frame.
+///
+/// `cv_pixel_buffer_ptr` (when non-zero) is a CVPixelBufferRef held with one
+/// reference owed to this VideoFrame. The custom `Clone`/`Drop` impls below
+/// keep that refcount accurate across the cache (which clones into L1/L2/L3)
+/// and the FFI hand-off (which moves the original to Swift). Without these,
+/// auto-derived `Clone` would copy the bare u64 without `CFRetain`, leaving
+/// the cached clones as dangling pointers once Swift releases its retain — a
+/// pre-existing UAF that surfaces as `objc_retain` crashes during scrubbing.
 pub struct VideoFrame {
     /// Raw pixel data (empty when `cv_pixel_buffer_ptr != 0`)
     pub data: Vec<u8>,
@@ -157,6 +173,49 @@ impl std::fmt::Debug for VideoFrame {
             .finish()
     }
 }
+
+impl Clone for VideoFrame {
+    fn clone(&self) -> Self {
+        #[cfg(target_os = "macos")]
+        if self.cv_pixel_buffer_ptr != 0 {
+            unsafe {
+                CFRetain(self.cv_pixel_buffer_ptr as *const std::ffi::c_void);
+            }
+        }
+        Self {
+            data: self.data.clone(),
+            width: self.width,
+            height: self.height,
+            stride: self.stride,
+            pts_us: self.pts_us,
+            duration_us: self.duration_us,
+            is_keyframe: self.is_keyframe,
+            frame_number: self.frame_number,
+            pixel_format: self.pixel_format,
+            cv_pixel_buffer_ptr: self.cv_pixel_buffer_ptr,
+        }
+    }
+}
+
+impl Drop for VideoFrame {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        if self.cv_pixel_buffer_ptr != 0 {
+            unsafe {
+                CFRelease(self.cv_pixel_buffer_ptr as *const std::ffi::c_void);
+            }
+            self.cv_pixel_buffer_ptr = 0;
+        }
+    }
+}
+
+// SAFETY: CVPixelBufferRef is thread-safe per Apple's CoreVideo docs — the
+// underlying buffer can be passed across threads, and CFRetain/CFRelease are
+// atomic. The cache holds VideoFrame across thread boundaries (decoder thread
+// → main thread), so we need both Send and Sync. The raw pointer field is the
+// only reason auto-derive doesn't grant these.
+unsafe impl Send for VideoFrame {}
+unsafe impl Sync for VideoFrame {}
 
 #[cfg(test)]
 mod tests {
