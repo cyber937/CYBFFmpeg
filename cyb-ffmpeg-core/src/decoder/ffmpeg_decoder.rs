@@ -21,11 +21,34 @@ use super::frame::VideoFrame;
 use super::info::{AudioTrack, CodecInfo, MediaInfo, VideoTrack};
 use crate::error::{Error, Result};
 
-// CoreFoundation retain — kept for the future VideoToolbox HW path.
-// The current decoder uses pure SW, so this is unused but harmless.
-#[allow(dead_code)]
+// CoreFoundation retain — used by the VideoToolbox HW path so the Swift
+// consumer can take ownership of the CVPixelBuffer (which is a CFTypeRef).
 extern "C" {
     fn CFRetain(cf: *const std::ffi::c_void) -> *const std::ffi::c_void;
+}
+
+/// `AVCodecContext::get_format` callback. H.264 calls this lazily, after
+/// SPS parsing on the first packet. We always pick `VIDEOTOOLBOX` when
+/// offered — the HWACCEL is registered on this build (verified at decoder
+/// init via `avcodec_get_hw_config`). If the HW format isn't on the
+/// candidate list we fall back to the first option, which is whatever
+/// SW pixfmt the codec defaults to.
+unsafe extern "C" fn get_videotoolbox_format(
+    _ctx: *mut ffmpeg::ffi::AVCodecContext,
+    pix_fmts: *const ffmpeg::ffi::AVPixelFormat,
+) -> ffmpeg::ffi::AVPixelFormat {
+    let mut p = pix_fmts;
+    let mut fallback = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE;
+    while !p.is_null() && *p != ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+        if *p == ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX {
+            return ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX;
+        }
+        if fallback == ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+            fallback = *p;
+        }
+        p = p.add(1);
+    }
+    fallback
 }
 
 /// FFmpeg decoder context
@@ -440,6 +463,46 @@ impl FFmpegContext {
         eprintln!("[CYB-RUST] decoder selected: {} (codec_id={:?}) — SW path",
             decoder_codec.name(), codec_id);
 
+        // Diagnostic: enumerate the HW configs this decoder advertises.
+        // For an FFmpeg build with `--enable-decoder=h264 --enable-videotoolbox`
+        // we expect at least one entry with device_type=videotoolbox and
+        // pix_fmt=videotoolbox. If none show up, the HWACCEL isn't actually
+        // wired into libavcodec at runtime even though `config.mak` says
+        // CONFIG_H264_VIDEOTOOLBOX_HWACCEL=yes.
+        unsafe {
+            let codec_ptr = decoder_codec.as_ptr();
+            let mut i = 0i32;
+            let mut any = false;
+            loop {
+                let config = ffmpeg::ffi::avcodec_get_hw_config(codec_ptr, i);
+                if config.is_null() {
+                    break;
+                }
+                any = true;
+                let cfg = &*config;
+                let pix_fmt_name_ptr = ffmpeg::ffi::av_get_pix_fmt_name(cfg.pix_fmt);
+                let pix_fmt_str = if pix_fmt_name_ptr.is_null() {
+                    "(null)".to_string()
+                } else {
+                    std::ffi::CStr::from_ptr(pix_fmt_name_ptr).to_string_lossy().into_owned()
+                };
+                let device_type_name_ptr = ffmpeg::ffi::av_hwdevice_get_type_name(cfg.device_type);
+                let device_type_str = if device_type_name_ptr.is_null() {
+                    "(null)".to_string()
+                } else {
+                    std::ffi::CStr::from_ptr(device_type_name_ptr).to_string_lossy().into_owned()
+                };
+                eprintln!(
+                    "[CYB-RUST] hw_config[{}]: pix_fmt={} device_type={} methods=0x{:x}",
+                    i, pix_fmt_str, device_type_str, cfg.methods
+                );
+                i += 1;
+            }
+            if !any {
+                eprintln!("[CYB-RUST] hw_config: NONE — HWACCEL not registered on this decoder");
+            }
+        }
+
         log::info!(
             "Using decoder: {} ({})",
             decoder_codec.name(),
@@ -458,6 +521,54 @@ impl FFmpegContext {
                 (*decoder_ctx.as_mut_ptr()).thread_count = config.thread_count as i32;
             }
         }
+
+        // Attach VideoToolbox HW device context if HWACCEL is registered for
+        // this codec. H.264 negotiates pix_fmt lazily (on first SPS parse),
+        // so we don't know HW vs SW at open time — frame format is checked
+        // per-frame in `create_video_frame_with_pts`. The SWS scaler is
+        // also initialized lazily on the first SW frame.
+        let mut hw_attached = false;
+        if config.prefer_hardware_decoding {
+            let has_vt_hwaccel = unsafe {
+                let mut i = 0i32;
+                let mut found = false;
+                loop {
+                    let cfg = ffmpeg::ffi::avcodec_get_hw_config(decoder_codec.as_ptr(), i);
+                    if cfg.is_null() { break; }
+                    if (*cfg).device_type == ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX {
+                        found = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                found
+            };
+            if has_vt_hwaccel {
+                let mut hw_device_ctx_ptr: *mut ffmpeg::ffi::AVBufferRef = std::ptr::null_mut();
+                let create_ret = unsafe {
+                    ffmpeg::ffi::av_hwdevice_ctx_create(
+                        &mut hw_device_ctx_ptr,
+                        ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+                        std::ptr::null(),
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                if create_ret >= 0 && !hw_device_ctx_ptr.is_null() {
+                    unsafe {
+                        let raw_ctx = decoder_ctx.as_mut_ptr();
+                        (*raw_ctx).hw_device_ctx = ffmpeg::ffi::av_buffer_ref(hw_device_ctx_ptr);
+                        (*raw_ctx).get_format = Some(get_videotoolbox_format);
+                        ffmpeg::ffi::av_buffer_unref(&mut hw_device_ctx_ptr);
+                    }
+                    hw_attached = true;
+                    eprintln!("[CYB-RUST] HW: hw_device_ctx attached (VIDEOTOOLBOX)");
+                } else {
+                    eprintln!("[CYB-RUST] HW: av_hwdevice_ctx_create failed (ret={}); SW only", create_ret);
+                }
+            }
+        }
+        let _ = hw_attached;  // Used implicitly via context state
 
         // Open decoder
         let mut video_decoder = decoder_ctx.decoder().video().map_err(|e| {
@@ -596,34 +707,9 @@ impl FFmpegContext {
             self.duration_us as f64 / 1_000_000.0
         );
 
-        // Initialize scaler for pixel format conversion. HW-decoded frames
-        // come out as `AV_PIX_FMT_VIDEOTOOLBOX` (a hardware reference, not
-        // pixel data); SWS can't process them, and we don't need it to —
-        // the CVPixelBuffer flows straight through the FFI.
-        if !self.is_hw_decoder {
-            let target_ffmpeg_format = Self::pixel_format_to_ffmpeg(self.target_format);
-            let source_format = video_decoder.format();
-
-            if source_format != target_ffmpeg_format {
-                let scaler = ScalerContext::get(
-                    source_format,
-                    self.width,
-                    self.height,
-                    target_ffmpeg_format,
-                    self.width,
-                    self.height,
-                    ScalerFlags::BILINEAR,
-                )
-                .map_err(|e| Error::DecodeFailed(format!("Failed to create scaler: {}", e)))?;
-
-                self.scaler = Some(scaler);
-                log::debug!(
-                    "Scaler initialized: {:?} -> {:?}",
-                    source_format,
-                    target_ffmpeg_format
-                );
-            }
-        }
+        // SWS scaler is initialized lazily on the first SW frame —
+        // `create_video_frame_with_pts` knows the actual frame format
+        // (HW vs SW) and only sets up the scaler when needed.
 
         self.video_decoder = Some(video_decoder);
         Ok(())
@@ -1367,15 +1453,49 @@ impl FFmpegContext {
 
                 log::debug!("receive_frame - raw pts={}, is_keyframe={}", pts, is_keyframe);
 
-                // Convert frame to target format
-                let output_frame = if let Some(ref mut scaler) = self.scaler {
-                    let mut scaled = VideoFrameFFmpeg::empty();
-                    scaler.run(&decoded, &mut scaled).map_err(|e| {
-                        Error::DecodeFailed(format!("Failed to scale frame: {}", e))
-                    })?;
-                    scaled
-                } else {
+                // Detect frame format. HW-decoded frames come in
+                // `AV_PIX_FMT_VIDEOTOOLBOX`; SWS can't handle them and we
+                // don't need it to (we read CVPixelBufferRef from data[3]
+                // in `create_video_frame_with_pts`). SW frames go through
+                // SWS — initialised lazily on first SW frame, recreated
+                // if dimensions change.
+                let frame_format = decoded.format();
+                let is_hw_frame = matches!(frame_format,
+                    ffmpeg::format::Pixel::VIDEOTOOLBOX);
+
+                let output_frame = if is_hw_frame {
+                    if !self.is_hw_decoder {
+                        eprintln!("[CYB-RUST] HW decode CONFIRMED — first VIDEOTOOLBOX frame received");
+                        self.is_hw_decoder = true;
+                    }
                     decoded
+                } else {
+                    // SW frame — make sure scaler exists for this size+format.
+                    let target_ffmpeg_format = Self::pixel_format_to_ffmpeg(self.target_format);
+                    let needs_new_scaler = self.scaler.is_none() && frame_format != target_ffmpeg_format;
+                    if needs_new_scaler {
+                        let scaler = ScalerContext::get(
+                            frame_format,
+                            decoded.width(),
+                            decoded.height(),
+                            target_ffmpeg_format,
+                            decoded.width(),
+                            decoded.height(),
+                            ScalerFlags::BILINEAR,
+                        ).map_err(|e| Error::DecodeFailed(format!("Failed to create scaler: {}", e)))?;
+                        self.scaler = Some(scaler);
+                        eprintln!("[CYB-RUST] SW: lazy SWS scaler initialised ({:?} → {:?}, {}x{})",
+                            frame_format, target_ffmpeg_format, decoded.width(), decoded.height());
+                    }
+                    if let Some(ref mut scaler) = self.scaler {
+                        let mut scaled = VideoFrameFFmpeg::empty();
+                        scaler.run(&decoded, &mut scaled).map_err(|e| {
+                            Error::DecodeFailed(format!("Failed to scale frame: {}", e))
+                        })?;
+                        scaled
+                    } else {
+                        decoded
+                    }
                 };
 
                 // Extract frame data using the pre-scaling timestamp
