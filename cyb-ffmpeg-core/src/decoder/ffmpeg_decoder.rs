@@ -27,6 +27,29 @@ extern "C" {
     fn CFRetain(cf: *const std::ffi::c_void) -> *const std::ffi::c_void;
 }
 
+/// `AVCodecContext::get_format` callback: tell FFmpeg we want the
+/// VideoToolbox pixel format when the HWACCEL is available. Frames will
+/// then come out with `format = AV_PIX_FMT_VIDEOTOOLBOX` and
+/// `data[3] = CVPixelBufferRef`. If VT isn't offered (e.g. unsupported
+/// codec / system), fall back to whatever default the codec picks.
+unsafe extern "C" fn get_videotoolbox_format(
+    _ctx: *mut ffmpeg::ffi::AVCodecContext,
+    pix_fmts: *const ffmpeg::ffi::AVPixelFormat,
+) -> ffmpeg::ffi::AVPixelFormat {
+    let mut p = pix_fmts;
+    let mut fallback = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE;
+    while !p.is_null() && *p != ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+        if *p == ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX {
+            return ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX;
+        }
+        if fallback == ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+            fallback = *p;
+        }
+        p = p.add(1);
+    }
+    fallback
+}
+
 /// FFmpeg decoder context
 pub struct FFmpegContext {
     /// Input format context
@@ -426,43 +449,20 @@ impl FFmpegContext {
             }
         }
 
-        // Find decoder. Prefer the standalone VideoToolbox HW decoder for
-        // codecs that support it — frames come out as CVPixelBuffer
-        // (`AV_PIX_FMT_VIDEOTOOLBOX`) so we skip SWS + the per-frame Vec
-        // copy across the FFI. Falls back to the regular SW decoder when
-        // the HW decoder isn't built into libavcodec at runtime.
+        // Find SW decoder. VideoToolbox HW acceleration is attached via
+        // `hw_device_ctx` after the context is created (FFmpeg models VT as
+        // a HWACCEL, not as a separate decoder; `find_by_name("h264_video-
+        // toolbox")` returns None on a stock LGPL build). HW frames come out
+        // of the regular SW decoder in `AV_PIX_FMT_VIDEOTOOLBOX` format with
+        // `frame.data[3]` carrying a `CVPixelBufferRef` — see the get_format
+        // callback below.
         let codec_id = codec_params.id();
-        let hw_decoder_name = if config.prefer_hardware_decoding {
-            match codec_id {
-                ffmpeg::codec::Id::H264 => Some("h264_videotoolbox"),
-                ffmpeg::codec::Id::HEVC => Some("hevc_videotoolbox"),
-                ffmpeg::codec::Id::PRORES => Some("prores_videotoolbox"),
-                ffmpeg::codec::Id::VP9 => Some("vp9_videotoolbox"),
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        let (decoder_codec, used_hw) = if let Some(name) = hw_decoder_name {
-            if let Some(hw) = ffmpeg::decoder::find_by_name(name) {
-                log::info!("Using {} HW decoder", name);
-                (hw, true)
-            } else {
-                let sw = ffmpeg::decoder::find(codec_id).ok_or_else(|| {
-                    Error::CodecNotSupported(format!("No decoder for codec: {:?}", codec_id))
-                })?;
-                log::warn!("{} not available, falling back to SW decoder {}", name, sw.name());
-                (sw, false)
-            }
-        } else {
-            let sw = ffmpeg::decoder::find(codec_id).ok_or_else(|| {
-                Error::CodecNotSupported(format!("No decoder for codec: {:?}", codec_id))
-            })?;
-            (sw, false)
-        };
-
-        self.is_hw_decoder = used_hw;
+        let decoder_codec = ffmpeg::decoder::find(codec_id).ok_or_else(|| {
+            Error::CodecNotSupported(format!("No decoder for codec: {:?}", codec_id))
+        })?;
+        let try_hw = config.prefer_hardware_decoding && Self::is_hardware_decodable(codec_id);
+        eprintln!("[CYB-RUST] decoder selected: {} (codec_id={:?}, will attempt HW={})",
+            decoder_codec.name(), codec_id, try_hw);
 
         log::info!(
             "Using decoder: {} ({})",
@@ -483,10 +483,52 @@ impl FFmpegContext {
             }
         }
 
+        // Attach VideoToolbox HW device context. The SW decoder will offer
+        // `AV_PIX_FMT_VIDEOTOOLBOX` in its `get_format` callback when a
+        // matching HWACCEL is available; we accept it so frames flow out
+        // as CVPixelBuffer references.
+        if try_hw {
+            let mut hw_device_ctx_ptr: *mut ffmpeg::ffi::AVBufferRef = std::ptr::null_mut();
+            let create_ret = unsafe {
+                ffmpeg::ffi::av_hwdevice_ctx_create(
+                    &mut hw_device_ctx_ptr,
+                    ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if create_ret >= 0 && !hw_device_ctx_ptr.is_null() {
+                unsafe {
+                    let raw_ctx = decoder_ctx.as_mut_ptr();
+                    (*raw_ctx).hw_device_ctx = ffmpeg::ffi::av_buffer_ref(hw_device_ctx_ptr);
+                    (*raw_ctx).get_format = Some(get_videotoolbox_format);
+                    // Drop our local reference; `hw_device_ctx` field owns one now.
+                    ffmpeg::ffi::av_buffer_unref(&mut hw_device_ctx_ptr);
+                }
+                self.is_hw_decoder = true;
+                eprintln!("[CYB-RUST] VideoToolbox hw_device_ctx attached");
+            } else {
+                eprintln!("[CYB-RUST] av_hwdevice_ctx_create(VIDEOTOOLBOX) failed (ret={}), continuing with SW decode", create_ret);
+            }
+        }
+
         // Open decoder
         let mut video_decoder = decoder_ctx.decoder().video().map_err(|e| {
             Error::DecodeFailed(format!("Failed to open video decoder: {}", e))
         })?;
+
+        // If HW was requested but the decoder ended up in a SW format, drop
+        // the flag so the rest of the pipeline takes the SW path.
+        if self.is_hw_decoder {
+            let pix_fmt = unsafe { (*video_decoder.as_ptr()).pix_fmt };
+            if pix_fmt as i32 != ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX as i32 {
+                eprintln!("[CYB-RUST] HW requested but decoder pix_fmt is {} (not VIDEOTOOLBOX); falling back to SW path", pix_fmt as i32);
+                self.is_hw_decoder = false;
+            } else {
+                eprintln!("[CYB-RUST] HW decode confirmed: pix_fmt = AV_PIX_FMT_VIDEOTOOLBOX");
+            }
+        }
 
         self.width = video_decoder.width();
         self.height = video_decoder.height();
@@ -1449,14 +1491,18 @@ impl FFmpegContext {
         // zero-copy VideoFrame. The original AVFrame's release will drop
         // the decoder's own retain when this function returns.
         if self.is_hw_decoder {
-            let cv_pixel_buffer_ptr = unsafe {
+            let (cv_pixel_buffer_ptr, av_format) = unsafe {
                 let av_frame_ptr = frame.as_ptr();
-                (*av_frame_ptr).data[3] as u64
+                ((*av_frame_ptr).data[3] as u64, (*av_frame_ptr).format)
             };
+
+            if self.frame_number == 0 {
+                eprintln!("[CYB-RUST] HW first frame: format={} (videotoolbox=188), cv_pixel_buffer_ptr={:#x}", av_format, cv_pixel_buffer_ptr);
+            }
 
             if cv_pixel_buffer_ptr == 0 {
                 return Err(Error::DecodeFailed(
-                    "HW decoder produced frame without CVPixelBuffer".to_string(),
+                    format!("HW decoder produced frame without CVPixelBuffer (av_format={})", av_format),
                 ));
             }
 
