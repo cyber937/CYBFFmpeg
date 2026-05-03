@@ -124,6 +124,14 @@ pub struct FFmpegContext {
 
     /// Keyframe index for fast seeking (built during prepare)
     keyframe_index: Option<KeyframeIndex>,
+
+    /// Last returned PTS (microseconds). Used to assert that frames come out
+    /// of `receive_frame` in display (monotonic) order after a seek.
+    last_returned_pts_us: Option<i64>,
+
+    /// Number of frames remaining in the post-seek monotonicity check window.
+    /// Set by every seek path; counts down inside `receive_frame`.
+    monotonic_check_frames_remaining: u32,
 }
 
 /// Keyframe index for fast seeking
@@ -266,6 +274,8 @@ impl FFmpegContext {
             audio_packet_queue: VecDeque::with_capacity(64),
             video_packet_queue: VecDeque::with_capacity(32),
             keyframe_index: None,
+            last_returned_pts_us: None,
+            monotonic_check_frames_remaining: 0,
         };
 
         // Initialize video decoder if we have a video stream
@@ -509,7 +519,18 @@ impl FFmpegContext {
             Error::DecodeFailed(format!("Failed to set codec parameters: {}", e))
         })?;
 
-        // Set threading options
+        // Set threading options.
+        //
+        // Default to FFmpeg's `thread_count = 0` (auto) so the H.264 decoder
+        // can use frame-level parallelism on SW path and slice-level on HW
+        // path (hwaccel disables frame threading internally). The previous
+        // build forced `thread_type = FF_THREAD_SLICE` + `thread_count = 1`
+        // as a (misdiagnosed) workaround for non-monotonic PTS after seek;
+        // the real root cause was `AVSEEK_FLAG_BYTE` bypassing the demuxer's
+        // `read_seek2` callback in `seek_precise`, which broke H.264 DPB
+        // reorder bookkeeping (SPS/PPS not re-emitted, `num_reorder_frames`
+        // never re-inferred). That is now fixed in `seek_to_keyframe_timestamp`,
+        // so default threading is safe again.
         if config.thread_count > 0 {
             unsafe {
                 (*decoder_ctx.as_mut_ptr()).thread_count = config.thread_count as i32;
@@ -568,6 +589,24 @@ impl FFmpegContext {
         let mut video_decoder = decoder_ctx.decoder().video().map_err(|e| {
             Error::DecodeFailed(format!("Failed to open video decoder: {}", e))
         })?;
+
+        // Diagnostic: confirm the threading config the decoder was actually
+        // opened with. `active_thread_type` is set by avcodec_open2 — if the
+        // codec rejected our requested thread_type, we'd see the difference
+        // here (e.g. active_thread_type=1 means frame threading is still on
+        // despite our FF_THREAD_SLICE request).
+        let (req_type, req_count, active_type) = unsafe {
+            let raw = video_decoder.as_ptr();
+            (
+                (*raw).thread_type,
+                (*raw).thread_count,
+                (*raw).active_thread_type,
+            )
+        };
+        eprintln!(
+            "[CYB-RUST] video decoder threading: requested type={} count={}, active type={}",
+            req_type, req_count, active_type
+        );
 
         self.width = video_decoder.width();
         self.height = video_decoder.height();
@@ -978,6 +1017,79 @@ impl FFmpegContext {
             let _ = resampler.flush(&mut flush_output);
         }
 
+        // Arm the post-seek monotonicity check.
+        self.last_returned_pts_us = None;
+        self.monotonic_check_frames_remaining = 30;
+
+        Ok(())
+    }
+
+    /// Stream-time-base timestamp seek that goes through the demuxer's
+    /// `read_seek2` callback (unlike `seek_to_byte_position` which uses
+    /// `AVSEEK_FLAG_BYTE` and bypasses container-aware seek). For MXF this
+    /// triggers edit-unit alignment + SPS/PPS in-band re-emission, which is
+    /// required for H.264 + VideoToolbox hwaccel to restore
+    /// `num_reorder_frames` and emit frames in display (monotonic PTS) order.
+    ///
+    /// Background: byte-position seek calls `seek_frame_byte` in
+    /// `libavformat/seek.c`, which intentionally bypasses the demuxer's
+    /// `read_seek2` callback. For containers that maintain non-trivial state
+    /// across edit units (MXF, MOV with fragments), this leaves the demuxer
+    /// in a state where the next packets fed to the H.264 decoder are
+    /// non-IDR slices with no preceding SPS/PPS. Without `bitstream_restriction_flag`
+    /// or fresh SPS, `num_reorder_frames` is never inferred, the H.264
+    /// front-end skips DPB-based reordering, and frames pass through in
+    /// decode order — observed on Sony FS7 H.264-in-MXF as a non-monotonic
+    /// PTS sequence after seek.
+    ///
+    /// `pts_us` is in microseconds (AV_TIME_BASE units). Pass the keyframe
+    /// PTS read from the keyframe index — the demuxer will land on the IDR
+    /// at or before that timestamp, but unlike `seek_to_byte_position` it
+    /// will run the container-aware seek path that re-establishes decoder
+    /// state.
+    pub fn seek_to_keyframe_timestamp(&mut self, pts_us: i64) -> Result<()> {
+        log::info!(
+            "FFmpegContext::seek_to_keyframe_timestamp - pts_us={}",
+            pts_us
+        );
+
+        // ffmpeg-next's high-level `seek` wraps `avformat_seek_file` with
+        // stream_idx=-1 (microseconds, AV_TIME_BASE_Q) and flags=0 — the
+        // container-aware path that triggers `read_seek2`.
+        if let Err(e) = self.input.seek(pts_us, ..pts_us) {
+            log::error!(
+                "FFmpegContext::seek_to_keyframe_timestamp - input.seek failed: {}",
+                e
+            );
+            return Err(Error::SeekFailed(pts_us));
+        }
+
+        // Same flush sequence as `seek_to_byte_position` and `seek`.
+        if let Some(ref mut decoder) = self.video_decoder {
+            decoder.flush();
+        }
+        if let Some(ref mut decoder) = self.audio_decoder {
+            decoder.flush();
+        }
+        self.audio_packet_queue.clear();
+        self.video_packet_queue.clear();
+        if let Some(ref mut resampler) = self.resampler {
+            let target_format = ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed);
+            let target_layout = ffmpeg::channel_layout::ChannelLayout::STEREO;
+            let mut flush_output = ffmpeg::frame::Audio::new(target_format, 4096, target_layout);
+            let _ = resampler.flush(&mut flush_output);
+        }
+
+        // Reset frame counters so the first frame after this seek has
+        // `frame_number == 0` (matches the behaviour of `seek`).
+        self.frame_number = 0;
+        self.audio_frame_number = 0;
+
+        // Arm the post-seek monotonicity check.
+        self.last_returned_pts_us = None;
+        self.monotonic_check_frames_remaining = 30;
+
+        log::info!("FFmpegContext::seek_to_keyframe_timestamp - complete");
         Ok(())
     }
 
@@ -1103,6 +1215,10 @@ impl FFmpegContext {
         self.frame_number = 0;
         self.audio_frame_number = 0;
 
+        // Arm the post-seek monotonicity check.
+        self.last_returned_pts_us = None;
+        self.monotonic_check_frames_remaining = 30;
+
         log::info!("FFmpegContext::seek - complete");
         Ok(())
     }
@@ -1123,25 +1239,42 @@ impl FFmpegContext {
         );
 
         // Use keyframe index for faster seeking if available.
-        // Track the keyframe pts so we can validate the byte seek landed
-        // where we expected — if not, we fall back to a timestamp seek.
+        //
+        // We use `seek_to_keyframe_timestamp` (not `seek_to_byte_position`)
+        // because byte-position seek (`AVSEEK_FLAG_BYTE`) bypasses the
+        // demuxer's `read_seek2` callback. For MXF, that callback handles
+        // edit-unit alignment and SPS/PPS in-band re-emission — without it,
+        // the H.264 + VideoToolbox decoder receives non-IDR slices with no
+        // fresh SPS, `num_reorder_frames` is never inferred, and frames
+        // come out in decode order (non-monotonic PTS) after seek.
+        //
+        // Timestamp seek avoids that: `avformat_seek_file` with `flags=0`
+        // routes through `read_seek2` which lands the demuxer on the
+        // edit-unit boundary at or before the requested PTS. The keyframe
+        // index still saves work — we already know the exact keyframe
+        // timestamp, so the demuxer doesn't have to scan to find one.
+        //
+        // `expected_kf_pts` is retained as an assertion: if the first
+        // decoded frame is far past the keyframe we asked for, the seek
+        // misbehaved (should not happen with timestamp seek, but if it
+        // does we want to know and fall back).
         let mut expected_kf_pts: Option<i64> = None;
         if let Some(ref index) = self.keyframe_index {
             if let Some((kf_pts, kf_pos)) = index.find_keyframe_before(time_us) {
                 log::info!(
-                    "FFmpegContext::seek_precise - using keyframe index: pts={} us, pos={} bytes",
+                    "FFmpegContext::seek_precise - using keyframe index: pts={} us (kf_pos={} bytes, ignored — using timestamp seek)",
                     kf_pts,
                     kf_pos
                 );
 
-                // Seek directly to byte position
-                match self.seek_to_byte_position(kf_pos) {
+                match self.seek_to_keyframe_timestamp(kf_pts) {
                     Ok(()) => {
                         expected_kf_pts = Some(kf_pts);
                     }
                     Err(e) => {
                         log::warn!(
-                            "FFmpegContext::seek_precise - byte seek failed: {:?}, falling back to time seek",
+                            "FFmpegContext::seek_precise - timestamp seek to kf_pts={} failed: {:?}, falling back to seek(time_us)",
+                            kf_pts,
                             e
                         );
                         self.seek(time_us)?;
@@ -1159,21 +1292,19 @@ impl FFmpegContext {
         // Now decode frames until we reach the target time.
         // We need to find the frame at or just before time_us.
         //
-        // Validation: AVSEEK_FLAG_BYTE is unreliable for MXF and other
-        // edit-unit-based containers — the demuxer can silently lose sync and
-        // skip forward. After byte-seeking to a keyframe at `kf_pts`, the
-        // first decoded frame should land at (or very close to) `kf_pts`. If
-        // it is further than SYNC_LOSS_THRESHOLD_US past the keyframe, the
-        // demuxer drifted; retry once via the timestamp-based `seek()` path,
-        // which uses the demuxer's own index tables.
+        // Assertion (kept from the byte-seek era): with timestamp seek the
+        // first decoded frame should land at (or very close to)
+        // `expected_kf_pts`. If it is further than `SYNC_LOSS_THRESHOLD_US`
+        // past, something has gone wrong upstream — log at error level and
+        // retry once via plain `seek()`. We don't expect this branch to fire
+        // in normal operation.
         let mut best_frame: Option<VideoFrame> = None;
         let max_frames = 300; // Limit to prevent infinite loop (enough for ~10 seconds at 30fps)
         let mut frame_count = 0;
         let mut tried_timestamp_fallback = false;
-        // ~6 frames at 24fps. Larger than any clean keyframe→first-frame gap
-        // (which should be 0 within rounding), small enough to catch the
-        // 200–800ms partial-skip cases observed on Sony FS7 MXF after heavy
-        // scrubbing — not just the multi-second jumps.
+        // ~6 frames at 24fps. Generous window because the post-seek first
+        // frame can be a few frames past the keyframe due to startup delay
+        // in the H.264 + VT decoder; anything past this is a bug.
         const SYNC_LOSS_THRESHOLD_US: i64 = 250_000;
 
         log::info!("FFmpegContext::seek_precise - decoding frames to reach target");
@@ -1199,19 +1330,19 @@ impl FFmpegContext {
                         time_us
                     );
 
-                    // First-frame validation: detect demuxer sync loss after
-                    // byte-position seek by comparing against the expected
-                    // keyframe pts (not the target). After a clean byte seek
-                    // the first decoded frame should be exactly the keyframe;
-                    // a significant overshoot means the demuxer skipped past it.
+                    // First-frame assertion: with timestamp seek (the primary
+                    // path now), the first decoded frame should be at or near
+                    // `expected_kf_pts`. If we ever see a large gap, the
+                    // container-aware seek failed in some surprising way —
+                    // log loudly and retry with plain `seek(time_us)`.
                     if let Some(kf_pts) = expected_kf_pts {
                         if !tried_timestamp_fallback
                             && frame_count == 1
                             && frame_pts > kf_pts + SYNC_LOSS_THRESHOLD_US
                         {
-                            log::warn!(
-                                "FFmpegContext::seek_precise - first frame at {} us is {} ms past expected keyframe at {} us \
-                                 (target {} us, demuxer sync loss after byte seek), falling back to timestamp seek",
+                            log::error!(
+                                "FFmpegContext::seek_precise - ASSERTION: first frame at {} us is {} ms past expected keyframe at {} us \
+                                 (target {} us). Timestamp seek did not land on the expected edit unit — bug?",
                                 frame_pts,
                                 (frame_pts - kf_pts) / 1_000,
                                 kf_pts,
@@ -1544,6 +1675,36 @@ impl FFmpegContext {
                 // Extract frame data using the pre-scaling timestamp
                 let frame = self.create_video_frame_with_pts(&output_frame, pts, is_keyframe)?;
                 self.frame_number += 1;
+
+                // Post-seek monotonicity check. After every seek path we arm
+                // `monotonic_check_frames_remaining = 30` and clear
+                // `last_returned_pts_us`. The first ~30 frames out of the
+                // decoder must be in display (monotonic-increasing PTS) order.
+                // If they aren't, the H.264 front-end's reorder bookkeeping
+                // (DPB / `delayed_pic[]`) is stale — typically because
+                // `AVSEEK_FLAG_BYTE` bypassed `read_seek2` and the demuxer
+                // delivered non-IDR slices before SPS was re-parsed. We log
+                // at error level so regressions are visible in the field.
+                if self.monotonic_check_frames_remaining > 0 {
+                    if let Some(prev) = self.last_returned_pts_us {
+                        if frame.pts_us < prev {
+                            log::error!(
+                                "FFmpegContext::receive_frame - ORDERING BUG: pts={} us < prev {} us (delta {} ms) within post-seek monotonicity window",
+                                frame.pts_us,
+                                prev,
+                                (prev - frame.pts_us) / 1_000
+                            );
+                            debug_assert!(
+                                frame.pts_us >= prev,
+                                "non-monotonic PTS {} < {} after seek",
+                                frame.pts_us,
+                                prev
+                            );
+                        }
+                    }
+                    self.last_returned_pts_us = Some(frame.pts_us);
+                    self.monotonic_check_frames_remaining -= 1;
+                }
 
                 Ok(Some(frame))
             }
