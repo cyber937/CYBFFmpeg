@@ -17,15 +17,9 @@ use ffmpeg_next::Rational;
 
 use super::audio_frame::AudioFrame;
 use super::config::{DecoderConfig, PixelFormat};
-use super::frame::VideoFrame;
+use super::frame::{VideoFrame, CFRetain};
 use super::info::{AudioTrack, CodecInfo, MediaInfo, VideoTrack};
 use crate::error::{Error, Result};
-
-// CoreFoundation retain — used by the VideoToolbox HW path so the Swift
-// consumer can take ownership of the CVPixelBuffer (which is a CFTypeRef).
-extern "C" {
-    fn CFRetain(cf: *const std::ffi::c_void) -> *const std::ffi::c_void;
-}
 
 /// `AVCodecContext::get_format` callback. H.264 calls this lazily, after
 /// SPS parsing on the first packet. We always pick `VIDEOTOOLBOX` when
@@ -1128,7 +1122,10 @@ impl FFmpegContext {
             self.keyframe_index.is_some()
         );
 
-        // Use keyframe index for faster seeking if available
+        // Use keyframe index for faster seeking if available.
+        // Track the keyframe pts so we can validate the byte seek landed
+        // where we expected — if not, we fall back to a timestamp seek.
+        let mut expected_kf_pts: Option<i64> = None;
         if let Some(ref index) = self.keyframe_index {
             if let Some((kf_pts, kf_pos)) = index.find_keyframe_before(time_us) {
                 log::info!(
@@ -1138,12 +1135,17 @@ impl FFmpegContext {
                 );
 
                 // Seek directly to byte position
-                if let Err(e) = self.seek_to_byte_position(kf_pos) {
-                    log::warn!(
-                        "FFmpegContext::seek_precise - byte seek failed: {:?}, falling back to time seek",
-                        e
-                    );
-                    self.seek(time_us)?;
+                match self.seek_to_byte_position(kf_pos) {
+                    Ok(()) => {
+                        expected_kf_pts = Some(kf_pts);
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "FFmpegContext::seek_precise - byte seek failed: {:?}, falling back to time seek",
+                            e
+                        );
+                        self.seek(time_us)?;
+                    }
                 }
             } else {
                 // No keyframe found, fall back to regular seek
@@ -1154,11 +1156,25 @@ impl FFmpegContext {
             self.seek(time_us)?;
         }
 
-        // Now decode frames until we reach the target time
-        // We need to find the frame at or just before time_us
+        // Now decode frames until we reach the target time.
+        // We need to find the frame at or just before time_us.
+        //
+        // Validation: AVSEEK_FLAG_BYTE is unreliable for MXF and other
+        // edit-unit-based containers — the demuxer can silently lose sync and
+        // skip forward. After byte-seeking to a keyframe at `kf_pts`, the
+        // first decoded frame should land at (or very close to) `kf_pts`. If
+        // it is further than SYNC_LOSS_THRESHOLD_US past the keyframe, the
+        // demuxer drifted; retry once via the timestamp-based `seek()` path,
+        // which uses the demuxer's own index tables.
         let mut best_frame: Option<VideoFrame> = None;
         let max_frames = 300; // Limit to prevent infinite loop (enough for ~10 seconds at 30fps)
         let mut frame_count = 0;
+        let mut tried_timestamp_fallback = false;
+        // ~6 frames at 24fps. Larger than any clean keyframe→first-frame gap
+        // (which should be 0 within rounding), small enough to catch the
+        // 200–800ms partial-skip cases observed on Sony FS7 MXF after heavy
+        // scrubbing — not just the multi-second jumps.
+        const SYNC_LOSS_THRESHOLD_US: i64 = 250_000;
 
         log::info!("FFmpegContext::seek_precise - decoding frames to reach target");
 
@@ -1182,6 +1198,33 @@ impl FFmpegContext {
                         frame_pts,
                         time_us
                     );
+
+                    // First-frame validation: detect demuxer sync loss after
+                    // byte-position seek by comparing against the expected
+                    // keyframe pts (not the target). After a clean byte seek
+                    // the first decoded frame should be exactly the keyframe;
+                    // a significant overshoot means the demuxer skipped past it.
+                    if let Some(kf_pts) = expected_kf_pts {
+                        if !tried_timestamp_fallback
+                            && frame_count == 1
+                            && frame_pts > kf_pts + SYNC_LOSS_THRESHOLD_US
+                        {
+                            log::warn!(
+                                "FFmpegContext::seek_precise - first frame at {} us is {} ms past expected keyframe at {} us \
+                                 (target {} us, demuxer sync loss after byte seek), falling back to timestamp seek",
+                                frame_pts,
+                                (frame_pts - kf_pts) / 1_000,
+                                kf_pts,
+                                time_us
+                            );
+                            self.seek(time_us)?;
+                            tried_timestamp_fallback = true;
+                            expected_kf_pts = None;
+                            best_frame = None;
+                            frame_count = 0;
+                            continue;
+                        }
+                    }
 
                     // Check if this frame is at or before the target
                     if frame_pts <= time_us {

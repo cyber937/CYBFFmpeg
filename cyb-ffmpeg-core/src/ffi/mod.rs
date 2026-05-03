@@ -597,12 +597,21 @@ pub extern "C" fn cyb_frame_get_data(
     }
 }
 
-/// Release frame handle
+/// Release frame handle.
+///
+/// Swift consumes the `cv_pixel_buffer_ptr`'s `+1` retain via
+/// `Unmanaged::takeRetainedValue()` in `cyb_frame_get_data`'s caller before
+/// reaching this point. Zero the pointer here so `VideoFrame::drop` (which
+/// would otherwise `CFRelease` the same retain) becomes a no-op for that
+/// field. The cache holds clones with their own retains (added by `Clone`)
+/// — those are released independently when the cache evicts them.
 #[no_mangle]
 pub extern "C" fn cyb_frame_release(frame_handle: *mut CybFrameHandle) {
     if !frame_handle.is_null() {
         unsafe {
-            drop(Box::from_raw(frame_handle));
+            let mut boxed = Box::from_raw(frame_handle);
+            boxed.frame.cv_pixel_buffer_ptr = 0;
+            drop(boxed);
         }
     }
 }
