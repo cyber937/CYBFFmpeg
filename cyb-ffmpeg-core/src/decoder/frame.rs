@@ -5,7 +5,7 @@ use super::config::PixelFormat;
 /// Decoded video frame
 #[derive(Clone)]
 pub struct VideoFrame {
-    /// Raw pixel data
+    /// Raw pixel data (empty when `cv_pixel_buffer_ptr != 0`)
     pub data: Vec<u8>,
 
     /// Frame width
@@ -31,6 +31,12 @@ pub struct VideoFrame {
 
     /// Pixel format
     pub pixel_format: PixelFormat,
+
+    /// CVPixelBufferRef pointer for VideoToolbox HW-decoded frames.
+    /// Non-zero means the decoder produced a CVPixelBuffer directly (no
+    /// SWS scaling, no Vec copy). Caller takes ownership of one CFRetain
+    /// — must release exactly once on the Swift side.
+    pub cv_pixel_buffer_ptr: u64,
 }
 
 impl VideoFrame {
@@ -56,6 +62,33 @@ impl VideoFrame {
             is_keyframe,
             frame_number,
             pixel_format,
+            cv_pixel_buffer_ptr: 0,
+        }
+    }
+
+    /// Create a HW-decoded frame backed by a CVPixelBuffer. Caller must
+    /// have already CFRetain'd the buffer once on behalf of the consumer
+    /// (the Swift bridge takes ownership of that retain).
+    pub fn new_hw(
+        cv_pixel_buffer_ptr: u64,
+        width: u32,
+        height: u32,
+        pts_us: i64,
+        duration_us: i64,
+        is_keyframe: bool,
+        frame_number: i64,
+    ) -> Self {
+        Self {
+            data: Vec::new(),
+            width,
+            height,
+            stride: 0,
+            pts_us,
+            duration_us,
+            is_keyframe,
+            frame_number,
+            pixel_format: PixelFormat::Nv12,
+            cv_pixel_buffer_ptr,
         }
     }
 
@@ -107,6 +140,7 @@ impl VideoFrame {
             is_keyframe: pts_us == 0,
             frame_number: pts_us / 16666,
             pixel_format: PixelFormat::Bgra,
+            cv_pixel_buffer_ptr: 0,
         }
     }
 }

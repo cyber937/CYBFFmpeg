@@ -409,17 +409,25 @@ internal final class RustBridge: @unchecked Sendable {
         var cybFrame = CybVideoFrame()
         cyb_frame_get_data(frameHandle, &cybFrame)
 
-        // Create CVPixelBuffer from raw data
-        let format = PixelFormat(rawValue: cybFrame.pixel_format)
-
-        let pixelBuffer = try PixelBufferConverter.convert(
-            data: cybFrame.data,
-            width: Int(cybFrame.width),
-            height: Int(cybFrame.height),
-            stride: Int(cybFrame.stride),
-            format: format,
-            dataSize: Int(cybFrame.data_size)
-        )
+        let pixelBuffer: CVPixelBuffer
+        if cybFrame.cv_pixel_buffer_ptr != 0 {
+            // VideoToolbox HW path: Rust already CFRetain'd the pixel
+            // buffer for us. `takeRetainedValue` consumes that retain;
+            // the buffer is released when this CVPixelBuffer is dropped.
+            let raw = UnsafeRawPointer(bitPattern: UInt(cybFrame.cv_pixel_buffer_ptr))!
+            pixelBuffer = Unmanaged<CVPixelBuffer>.fromOpaque(raw).takeRetainedValue()
+        } else {
+            // SW path: copy raw pixel data into a pooled CVPixelBuffer.
+            let format = PixelFormat(rawValue: cybFrame.pixel_format)
+            pixelBuffer = try PixelBufferConverter.convert(
+                data: cybFrame.data,
+                width: Int(cybFrame.width),
+                height: Int(cybFrame.height),
+                stride: Int(cybFrame.stride),
+                format: format,
+                dataSize: Int(cybFrame.data_size)
+            )
+        }
 
         return FFmpegFrame(
             pixelBuffer: pixelBuffer,
