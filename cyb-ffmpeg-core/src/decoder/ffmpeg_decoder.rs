@@ -521,28 +521,17 @@ impl FFmpegContext {
 
         // Set threading options.
         //
-        // Force single-threaded decode for the video stream. With the default
-        // `thread_count = 0` (auto) and FF_THREAD_FRAME enabled, the H.264
-        // decoder dispatches packets to multiple worker threads that decode
-        // frames in parallel; immediately after a flush (e.g. seek_precise's
-        // keyframe-index byte seek), `avcodec_receive_frame` returns frames
-        // in *completion* order rather than presentation order — observed on
-        // Sony FS7 H.264-in-MXF playback as a non-monotonic PTS sequence
-        // (e.g. 75.533, 75.450, 75.366, 75.658, 75.575...) that confused the
-        // ring buffer and AV-sync code into reporting persistent video-ahead
-        // drift after a scrub→play transition. Setting both `thread_type =
-        // FF_THREAD_SLICE` and `thread_count = 1` guarantees serialized output
-        // (strictly monotonic PTS), which the downstream prefetch loop and
-        // DisplayLink callback assume. Performance impact is negligible
-        // because VideoToolbox HW accel does the actual decode work — CPU
-        // threading here only governs the FFmpeg wrapper plumbing.
-        unsafe {
-            (*decoder_ctx.as_mut_ptr()).thread_type = ffmpeg::ffi::FF_THREAD_SLICE as i32;
-            (*decoder_ctx.as_mut_ptr()).thread_count = 1;
-        }
-        // Honor explicit override from config (only if > 1, to keep the
-        // single-threaded default safe).
-        if config.thread_count > 1 {
+        // Default to FFmpeg's `thread_count = 0` (auto) so the H.264 decoder
+        // can use frame-level parallelism on SW path and slice-level on HW
+        // path (hwaccel disables frame threading internally). The previous
+        // build forced `thread_type = FF_THREAD_SLICE` + `thread_count = 1`
+        // as a (misdiagnosed) workaround for non-monotonic PTS after seek;
+        // the real root cause was `AVSEEK_FLAG_BYTE` bypassing the demuxer's
+        // `read_seek2` callback in `seek_precise`, which broke H.264 DPB
+        // reorder bookkeeping (SPS/PPS not re-emitted, `num_reorder_frames`
+        // never re-inferred). That is now fixed in `seek_to_keyframe_timestamp`,
+        // so default threading is safe again.
+        if config.thread_count > 0 {
             unsafe {
                 (*decoder_ctx.as_mut_ptr()).thread_count = config.thread_count as i32;
             }
