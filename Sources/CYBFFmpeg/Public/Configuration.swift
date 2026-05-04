@@ -33,6 +33,22 @@ public struct DecoderConfiguration: Sendable {
     /// Default `false` preserves playback behavior for existing callers.
     public let skipKeyframeIndexing: Bool
 
+    /// Optional disk-cache file path for the keyframe index.
+    ///
+    /// When set, `prepare()` will try to load a previously-saved index
+    /// from this path before building one. The cache file embeds the
+    /// source file's `(size, mtime)` and is rejected (treated as a miss)
+    /// when either differs from the current source. On a cache miss the
+    /// index is built normally and then written back to this path, so
+    /// subsequent prepares on the same source hit the cache.
+    ///
+    /// Useful for re-opening projects that import large MXF files where
+    /// `build_keyframe_index` is the dominant cost — cached re-opens
+    /// drop from ~25s to <100ms.
+    ///
+    /// Default `nil` preserves current behavior (always rebuild).
+    public let keyframeIndexCachePath: String?
+
     // MARK: Initialization
 
     /// Create a custom configuration
@@ -41,13 +57,15 @@ public struct DecoderConfiguration: Sendable {
         cacheConfiguration: CacheConfiguration = .default,
         threadCount: Int = 0,
         outputPixelFormat: PixelFormat = .nv12,
-        skipKeyframeIndexing: Bool = false
+        skipKeyframeIndexing: Bool = false,
+        keyframeIndexCachePath: String? = nil
     ) {
         self.preferHardwareDecoding = preferHardwareDecoding
         self.cacheConfiguration = cacheConfiguration
         self.threadCount = threadCount
         self.outputPixelFormat = outputPixelFormat
         self.skipKeyframeIndexing = skipKeyframeIndexing
+        self.keyframeIndexCachePath = keyframeIndexCachePath
     }
 
     // MARK: Presets

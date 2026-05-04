@@ -67,6 +67,14 @@ typedef struct CybDecoderConfig {
     // Suitable for callers that only need metadata/timecode and will not
     // seek or play back. Default behavior (`false`) is preserved.
     bool skip_keyframe_indexing;
+    // Optional UTF-8, NUL-terminated path to a disk-cache file for the
+    // keyframe index. Pass NULL to disable caching (default behavior:
+    // rebuild every time). When set, `prepare()` first tries to load a
+    // previously-saved index from this path; on miss/stale, it builds
+    // the index normally and saves it back. The pointer only needs to
+    // be valid for the duration of the `cyb_decoder_create` call —
+    // Rust copies the string into its own allocation.
+    const char *keyframe_index_cache_path;
 } CybDecoderConfig;
 
 typedef struct CybCacheStats {
