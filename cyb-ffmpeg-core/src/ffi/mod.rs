@@ -129,10 +129,27 @@ pub struct CybDecoderConfig {
     /// Suitable for callers that only need metadata/timecode and will not
     /// seek or play back. Default behavior (`false`) is preserved.
     pub skip_keyframe_indexing: bool,
+    /// Optional UTF-8, NUL-terminated path to a disk-cache file for the
+    /// keyframe index. Pass NULL to disable caching (default behavior:
+    /// rebuild every time). When set, `prepare()` first tries to load a
+    /// previously-saved index from this path; on miss/stale, it builds
+    /// the index normally and saves it back. The pointer only needs to
+    /// be valid for the duration of the `cyb_decoder_create` call —
+    /// Rust copies the string into its own allocation.
+    pub keyframe_index_cache_path: *const c_char,
 }
 
 impl From<&CybDecoderConfig> for DecoderConfig {
     fn from(c: &CybDecoderConfig) -> Self {
+        let cache_path = if c.keyframe_index_cache_path.is_null() {
+            None
+        } else {
+            unsafe { CStr::from_ptr(c.keyframe_index_cache_path) }
+                .to_str()
+                .ok()
+                .map(|s| s.to_owned())
+        };
+
         DecoderConfig {
             prefer_hardware_decoding: c.prefer_hardware_decoding,
             l1_cache_capacity: c.cache_config.l1_capacity,
@@ -146,6 +163,7 @@ impl From<&CybDecoderConfig> for DecoderConfig {
                 _ => PixelFormat::Yuv420p,
             },
             skip_keyframe_indexing: c.skip_keyframe_indexing,
+            keyframe_index_cache_path: cache_path,
         }
     }
 }

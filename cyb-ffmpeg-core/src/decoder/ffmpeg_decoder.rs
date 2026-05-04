@@ -215,6 +215,125 @@ impl KeyframeIndex {
             }
         }
     }
+
+    /// Save the index to disk, embedding the source file's (size, mtime)
+    /// so a later load can detect if the source file has changed.
+    ///
+    /// File format (little-endian, packed):
+    /// ```text
+    ///   [magic        4B] = "KFIX"
+    ///   [version     u32] = 1
+    ///   [src_size    u64] = source file byte size at build time
+    ///   [src_mtime   i64] = source file modification time, seconds since UNIX epoch
+    ///   [count       u32] = entry count
+    ///   [entries     ...] = (pts_us i64, byte_position i64) × count
+    /// ```
+    pub fn save_to_disk(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        source_size: u64,
+        source_mtime_secs: i64,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+
+        if let Some(parent) = path.as_ref().parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Write to a temp file then rename, so a partial write never
+        // leaves a corrupt cache that load_from_disk would happily try
+        // to parse.
+        let tmp_path = path.as_ref().with_extension("kfix.tmp");
+        let mut f = std::fs::File::create(&tmp_path)?;
+
+        f.write_all(b"KFIX")?;
+        f.write_all(&1u32.to_le_bytes())?;
+        f.write_all(&source_size.to_le_bytes())?;
+        f.write_all(&source_mtime_secs.to_le_bytes())?;
+        let count = self.entries.len() as u32;
+        f.write_all(&count.to_le_bytes())?;
+        for (pts, pos) in &self.entries {
+            f.write_all(&pts.to_le_bytes())?;
+            f.write_all(&pos.to_le_bytes())?;
+        }
+        f.flush()?;
+        drop(f);
+        std::fs::rename(&tmp_path, path.as_ref())?;
+        Ok(())
+    }
+
+    /// Try to load an index previously saved by `save_to_disk`. Returns
+    /// `None` (not an error) when:
+    /// * the file does not exist,
+    /// * the magic / version doesn't match,
+    /// * the embedded `(size, mtime)` differs from the current source
+    ///   file (= source has changed since the index was built),
+    /// * the file is truncated or otherwise malformed.
+    ///
+    /// Any other I/O error is surfaced.
+    pub fn load_from_disk(
+        path: impl AsRef<std::path::Path>,
+        source_size: u64,
+        source_mtime_secs: i64,
+    ) -> std::io::Result<Option<Self>> {
+        use std::io::Read;
+
+        let mut f = match std::fs::File::open(path.as_ref()) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+
+        let mut magic = [0u8; 4];
+        if f.read_exact(&mut magic).is_err() || &magic != b"KFIX" {
+            return Ok(None);
+        }
+        let mut buf32 = [0u8; 4];
+        if f.read_exact(&mut buf32).is_err() {
+            return Ok(None);
+        }
+        let version = u32::from_le_bytes(buf32);
+        if version != 1 {
+            return Ok(None);
+        }
+        let mut buf64 = [0u8; 8];
+        if f.read_exact(&mut buf64).is_err() {
+            return Ok(None);
+        }
+        let stored_size = u64::from_le_bytes(buf64);
+        if f.read_exact(&mut buf64).is_err() {
+            return Ok(None);
+        }
+        let stored_mtime = i64::from_le_bytes(buf64);
+
+        if stored_size != source_size || stored_mtime != source_mtime_secs {
+            return Ok(None);
+        }
+
+        if f.read_exact(&mut buf32).is_err() {
+            return Ok(None);
+        }
+        let count = u32::from_le_bytes(buf32) as usize;
+
+        // Sanity: 16 bytes per entry, refuse absurdly large headers.
+        if count > 10_000_000 {
+            return Ok(None);
+        }
+
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            if f.read_exact(&mut buf64).is_err() {
+                return Ok(None);
+            }
+            let pts = i64::from_le_bytes(buf64);
+            if f.read_exact(&mut buf64).is_err() {
+                return Ok(None);
+            }
+            let pos = i64::from_le_bytes(buf64);
+            entries.push((pts, pos));
+        }
+
+        Ok(Some(Self { entries }))
+    }
 }
 
 impl FFmpegContext {
@@ -2412,6 +2531,13 @@ impl FFmpegContext {
     pub fn has_keyframe_index(&self) -> bool {
         self.keyframe_index.is_some()
     }
+
+    /// Inject a pre-loaded keyframe index (e.g. from disk cache) instead
+    /// of building one by walking the stream. Used by `Decoder::prepare`
+    /// when `keyframe_index_cache_path` resolves to a valid cache hit.
+    pub fn set_keyframe_index(&mut self, index: KeyframeIndex) {
+        self.keyframe_index = Some(index);
+    }
 }
 
 /// Try to build a [`Timecode`] from the per-stream and format-level "timecode"
@@ -2483,6 +2609,87 @@ mod tests {
         // Round trip
         let pts = FFmpegContext::us_to_pts(us, time_base);
         assert_eq!(pts, 90000);
+    }
+
+    // -- KeyframeIndex disk cache --------------------------------------------
+
+    fn temp_cache_path(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("cyb-ffmpeg-kfix-test-{}-{}.bin",
+            name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()));
+        p
+    }
+
+    #[test]
+    fn keyframe_index_save_load_roundtrip() {
+        let mut idx = KeyframeIndex::new();
+        idx.add(0, 0);
+        idx.add(1_000_000, 4096);
+        idx.add(5_000_000, 16384);
+        idx.sort();
+
+        let path = temp_cache_path("roundtrip");
+        idx.save_to_disk(&path, 12345, 1_700_000_000).expect("save");
+
+        let loaded = KeyframeIndex::load_from_disk(&path, 12345, 1_700_000_000)
+            .expect("io ok")
+            .expect("entry exists");
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded.find_keyframe_before(2_000_000), Some((1_000_000, 4096)));
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn keyframe_index_load_returns_none_when_size_changes() {
+        let mut idx = KeyframeIndex::new();
+        idx.add(0, 0);
+
+        let path = temp_cache_path("size-mismatch");
+        idx.save_to_disk(&path, 1000, 1_700_000_000).expect("save");
+
+        let loaded = KeyframeIndex::load_from_disk(&path, 9999, 1_700_000_000)
+            .expect("io ok");
+        assert!(loaded.is_none());
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn keyframe_index_load_returns_none_when_mtime_changes() {
+        let mut idx = KeyframeIndex::new();
+        idx.add(0, 0);
+
+        let path = temp_cache_path("mtime-mismatch");
+        idx.save_to_disk(&path, 1000, 1_700_000_000).expect("save");
+
+        let loaded = KeyframeIndex::load_from_disk(&path, 1000, 1_700_000_001)
+            .expect("io ok");
+        assert!(loaded.is_none());
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn keyframe_index_load_returns_none_when_file_missing() {
+        let path = temp_cache_path("does-not-exist");
+        let loaded = KeyframeIndex::load_from_disk(&path, 1000, 1_700_000_000)
+            .expect("io ok");
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn keyframe_index_load_returns_none_when_magic_wrong() {
+        let path = temp_cache_path("bad-magic");
+        std::fs::write(&path, b"NOPEbadbadbadbadbadbadbadbadbad").unwrap();
+        let loaded = KeyframeIndex::load_from_disk(&path, 1000, 1_700_000_000)
+            .expect("io ok");
+        assert!(loaded.is_none());
+        std::fs::remove_file(path).ok();
     }
 
     // -- extract_video_timecode -----------------------------------------------

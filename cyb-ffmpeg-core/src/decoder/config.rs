@@ -58,6 +58,20 @@ pub struct DecoderConfig {
     ///
     /// Default `false` to preserve playback behavior for existing callers.
     pub skip_keyframe_indexing: bool,
+
+    /// Optional path to a disk cache file for the keyframe index.
+    ///
+    /// When set, `Decoder::prepare()` will:
+    /// 1. Try to load a previously-saved index from this path. The cache
+    ///    file embeds the source file's `(size, mtime_secs)` and is
+    ///    rejected if either differs from the current source file.
+    /// 2. On cache miss, build the index normally and write it to this
+    ///    path before returning, so subsequent calls hit the cache.
+    ///
+    /// Skipped entirely when `skip_keyframe_indexing` is `true`.
+    ///
+    /// Default `None` preserves current behavior (always rebuild).
+    pub keyframe_index_cache_path: Option<String>,
 }
 
 impl Default for DecoderConfig {
@@ -71,6 +85,7 @@ impl Default for DecoderConfig {
             thread_count: 0,
             output_pixel_format: PixelFormat::Nv12,
             skip_keyframe_indexing: false,
+            keyframe_index_cache_path: None,
         }
     }
 }
@@ -87,6 +102,7 @@ impl DecoderConfig {
             thread_count: 0,
             output_pixel_format: PixelFormat::Nv12,
             skip_keyframe_indexing: false,
+            keyframe_index_cache_path: None,
         }
     }
 
@@ -101,6 +117,7 @@ impl DecoderConfig {
             thread_count: 2,
             output_pixel_format: PixelFormat::Nv12,
             skip_keyframe_indexing: false,
+            keyframe_index_cache_path: None,
         }
     }
 
@@ -115,6 +132,7 @@ impl DecoderConfig {
             thread_count: 0,
             output_pixel_format: PixelFormat::Nv12,
             skip_keyframe_indexing: false,
+            keyframe_index_cache_path: None,
         }
     }
 
@@ -132,6 +150,7 @@ impl DecoderConfig {
             thread_count: 1,
             output_pixel_format: PixelFormat::Nv12,
             skip_keyframe_indexing: true,
+            keyframe_index_cache_path: None,
         }
     }
 }
@@ -169,5 +188,17 @@ mod tests {
     fn test_default_does_not_skip_indexing() {
         let cfg = DecoderConfig::default();
         assert!(!cfg.skip_keyframe_indexing);
+    }
+
+    #[test]
+    fn test_default_has_no_keyframe_index_cache_path() {
+        let cfg = DecoderConfig::default();
+        assert!(cfg.keyframe_index_cache_path.is_none());
+    }
+
+    #[test]
+    fn test_metadata_only_has_no_cache_path() {
+        let cfg = DecoderConfig::metadata_only();
+        assert!(cfg.keyframe_index_cache_path.is_none());
     }
 }

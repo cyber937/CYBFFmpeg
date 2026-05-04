@@ -38,9 +38,19 @@ internal final class RustBridge: @unchecked Sendable {
         // Ensure Rust library is initialized
         _ = Self.initOnce
 
-        var config = configuration.toCybConfig()
+        // The keyframe-index cache path crosses FFI as a `*const c_char`
+        // that only needs to be valid for the duration of
+        // `cyb_decoder_create` (Rust copies into a `String` internally).
+        // We use `withCString` to get a stable C pointer for the call —
+        // passing `nil` when the path isn't configured.
+        let cachePath = configuration.keyframeIndexCachePath
+        let handle: OpaquePointer? = (cachePath ?? "").withCString { cachePtr in
+            var config = configuration.toCybConfig()
+            config.keyframe_index_cache_path = (cachePath != nil) ? cachePtr : nil
+            return cyb_decoder_create(path, &config)
+        }
 
-        guard let handle = cyb_decoder_create(path, &config) else {
+        guard let handle = handle else {
             let error = Self.getLastError()
             throw FFmpegError.invalidFormat(error ?? "Failed to create decoder")
         }
@@ -498,13 +508,18 @@ internal final class RustBridge: @unchecked Sendable {
 // MARK: - Configuration Extensions
 
 extension DecoderConfiguration {
+    /// Build a `CybDecoderConfig` with `keyframe_index_cache_path` left as
+    /// `nil`. Callers that want the disk cache must overwrite the field
+    /// inside a `withCString { ... }` scope so the C pointer outlives the
+    /// `cyb_decoder_create` call (see `RustBridge.init`).
     func toCybConfig() -> CybDecoderConfig {
         CybDecoderConfig(
             prefer_hardware_decoding: preferHardwareDecoding,
             cache_config: cacheConfiguration.toCybConfig(),
             thread_count: UInt32(threadCount),
             output_pixel_format: outputPixelFormat.toCybFormat(),
-            skip_keyframe_indexing: skipKeyframeIndexing
+            skip_keyframe_indexing: skipKeyframeIndexing,
+            keyframe_index_cache_path: nil
         )
     }
 }
