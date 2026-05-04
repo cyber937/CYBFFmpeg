@@ -63,6 +63,10 @@ typedef struct CybDecoderConfig {
     struct CybCacheConfig cache_config;
     uint32_t thread_count;
     uint8_t output_pixel_format;
+    // When true, `cyb_decoder_prepare` skips building the keyframe index.
+    // Suitable for callers that only need metadata/timecode and will not
+    // seek or play back. Default behavior (`false`) is preserved.
+    bool skip_keyframe_indexing;
 } CybDecoderConfig;
 
 typedef struct CybCacheStats {

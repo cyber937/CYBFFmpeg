@@ -125,6 +125,10 @@ pub struct CybDecoderConfig {
     pub cache_config: CybCacheConfig,
     pub thread_count: u32,
     pub output_pixel_format: u8, // 0=BGRA, 1=NV12, 2=YUV420P
+    /// When true, `cyb_decoder_prepare` skips building the keyframe index.
+    /// Suitable for callers that only need metadata/timecode and will not
+    /// seek or play back. Default behavior (`false`) is preserved.
+    pub skip_keyframe_indexing: bool,
 }
 
 impl From<&CybDecoderConfig> for DecoderConfig {
@@ -141,6 +145,7 @@ impl From<&CybDecoderConfig> for DecoderConfig {
                 1 => PixelFormat::Nv12,
                 _ => PixelFormat::Yuv420p,
             },
+            skip_keyframe_indexing: c.skip_keyframe_indexing,
         }
     }
 }
