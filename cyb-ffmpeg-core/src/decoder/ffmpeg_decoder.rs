@@ -891,6 +891,8 @@ impl FFmpegContext {
                     color_primaries: None,
                     color_transfer: None,
                     color_range: "unknown".to_string(),
+                    frame_rate_exact: None,
+                    start_timecode: None,
                 };
 
                 video_tracks.push(video_track);
