@@ -366,6 +366,17 @@ internal final class RustBridge: @unchecked Sendable {
         let codecName = cyb.codec_name.map { String(cString: $0) } ?? "unknown"
         let codecLongName = cyb.codec_long_name.map { String(cString: $0) } ?? "Unknown"
 
+        let frameRateExact: FFmpegFrameRate? = cyb.has_frame_rate_exact
+            ? FFmpegFrameRate(
+                numerator: cyb.frame_rate_exact.num,
+                denominator: cyb.frame_rate_exact.den
+            )
+            : nil
+
+        let startTimecode: FFmpegTimecode? = cyb.has_start_timecode
+            ? convertTimecode(cyb.start_timecode)
+            : nil
+
         return FFmpegVideoTrack(
             index: Int(cyb.index),
             codec: FFmpegCodec(
@@ -376,6 +387,8 @@ internal final class RustBridge: @unchecked Sendable {
             width: Int(cyb.width),
             height: Int(cyb.height),
             frameRate: cyb.frame_rate,
+            frameRateExact: frameRateExact,
+            startTimecode: startTimecode,
             bitRate: cyb.bit_rate > 0 ? cyb.bit_rate : nil,
             pixelFormat: "unknown",
             isHardwareDecodable: cyb.is_hardware_decodable,
@@ -383,6 +396,24 @@ internal final class RustBridge: @unchecked Sendable {
             colorPrimaries: nil,
             colorTransfer: nil,
             colorRange: .unknown
+        )
+    }
+
+    private static func convertTimecode(_ cyb: CybTimecode) -> FFmpegTimecode {
+        let rate = FFmpegFrameRate(
+            numerator: cyb.rate.num,
+            denominator: cyb.rate.den
+        )
+        let detail = cyb.source_detail.map { String(cString: $0) } ?? ""
+        let kind = FFmpegTimecodeSourceKind(rawValue: cyb.source_kind) ?? .unknown
+
+        return FFmpegTimecode(
+            frameNumber: cyb.frame_number,
+            rate: rate,
+            dropFrame: cyb.drop_frame,
+            sourceKind: kind,
+            sourceDetail: detail,
+            confidence: cyb.confidence
         )
     }
 

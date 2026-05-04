@@ -9,7 +9,10 @@ use std::ptr;
 use parking_lot::Mutex;
 
 use crate::cache::CacheStatistics;
-use crate::decoder::{AudioFrame, Decoder, DecoderConfig, MediaInfo, PixelFormat, VideoFrame};
+use crate::decoder::{
+    AudioFrame, Decoder, DecoderConfig, FrameRate, MediaInfo, PixelFormat, Timecode,
+    TimecodeSourceKind, VideoFrame,
+};
 use crate::error::Error;
 
 // Thread-local error storage
@@ -620,6 +623,48 @@ pub extern "C" fn cyb_frame_release(frame_handle: *mut CybFrameHandle) {
 // Media Info Types
 // =============================================================================
 
+/// Exact frame rate as a rational number (`num / den`). Mirrors
+/// [`crate::decoder::FrameRate`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CybFrameRate {
+    pub num: u32,
+    pub den: u32,
+}
+
+/// Source kind for an embedded SMPTE timecode. Mirrors
+/// [`crate::decoder::TimecodeSourceKind`].
+#[repr(u8)]
+#[derive(Clone, Copy)]
+pub enum CybTimecodeSourceKind {
+    TmcdTrack = 0,
+    MxfMaterialPackage = 1,
+    MxfSourcePackage = 2,
+    ContainerMetadata = 3,
+    Inferred = 4,
+    Unknown = 5,
+}
+
+/// Embedded SMPTE timecode. Mirrors [`crate::decoder::Timecode`].
+///
+/// `source_detail` points into a CString stored inside the owning
+/// `CybMediaInfoHandle`; do not free or outlive the handle.
+#[repr(C)]
+pub struct CybTimecode {
+    /// Absolute frame number (canonical lossless representation).
+    pub frame_number: i64,
+    /// Exact frame rate.
+    pub rate: CybFrameRate,
+    /// True if drop-frame timecode (29.97 / 59.94 family).
+    pub drop_frame: bool,
+    /// Where the timecode was sourced from.
+    pub source_kind: CybTimecodeSourceKind,
+    /// Free-form provenance string (e.g., "ffmpeg:mxf:format:timecode").
+    pub source_detail: *const c_char,
+    /// Confidence in the value, 0.0..=1.0.
+    pub confidence: f32,
+}
+
 /// Video track info for FFI
 #[repr(C)]
 pub struct CybVideoTrack {
@@ -628,9 +673,20 @@ pub struct CybVideoTrack {
     pub codec_long_name: *const c_char,
     pub width: i32,
     pub height: i32,
+    /// Approximate frame rate, lossy for NTSC family. Use `frame_rate_exact`
+    /// when `has_frame_rate_exact` is true for a lossless rational.
     pub frame_rate: f64,
     pub bit_rate: i64,
     pub is_hardware_decodable: bool,
+    /// Whether `frame_rate_exact` carries a meaningful value.
+    pub has_frame_rate_exact: bool,
+    /// Lossless rational frame rate (24000/1001 etc.). Only valid when
+    /// `has_frame_rate_exact` is true.
+    pub frame_rate_exact: CybFrameRate,
+    /// Whether `start_timecode` carries a meaningful value.
+    pub has_start_timecode: bool,
+    /// Embedded SMPTE timecode. Only valid when `has_start_timecode` is true.
+    pub start_timecode: CybTimecode,
 }
 
 /// Audio track info for FFI
@@ -659,6 +715,10 @@ pub struct CybMediaInfoHandle {
     container_format_cstr: CString,
     codec_names: Vec<CString>,
     codec_long_names: Vec<CString>,
+    /// Owned source-detail strings, one per video track (empty CString when
+    /// the track has no embedded timecode). Indexed parallel to
+    /// `info.video_tracks`.
+    timecode_source_details: Vec<CString>,
 }
 
 /// Get media info
@@ -682,6 +742,7 @@ pub extern "C" fn cyb_decoder_get_media_info(
             // Pre-allocate string storage
             let mut codec_names = Vec::new();
             let mut codec_long_names = Vec::new();
+            let mut timecode_source_details = Vec::new();
 
             for track in &info.video_tracks {
                 codec_names.push(
@@ -691,6 +752,14 @@ pub extern "C" fn cyb_decoder_get_media_info(
                 codec_long_names.push(
                     CString::new(track.codec.long_name.clone())
                         .unwrap_or_else(|_| CString::new("").unwrap()),
+                );
+                let detail = track
+                    .start_timecode
+                    .as_ref()
+                    .map(|tc| tc.source_detail.clone())
+                    .unwrap_or_default();
+                timecode_source_details.push(
+                    CString::new(detail).unwrap_or_else(|_| CString::new("").unwrap()),
                 );
             }
 
@@ -710,6 +779,7 @@ pub extern "C" fn cyb_decoder_get_media_info(
                 container_format_cstr,
                 codec_names,
                 codec_long_names,
+                timecode_source_details,
             });
 
             unsafe {
@@ -766,6 +836,27 @@ pub extern "C" fn cyb_media_info_get_video_track(
 
     let track = &info.video_tracks[index as usize];
 
+    let zero_rate = CybFrameRate { num: 0, den: 0 };
+    let zero_tc = CybTimecode {
+        frame_number: 0,
+        rate: zero_rate,
+        drop_frame: false,
+        source_kind: CybTimecodeSourceKind::Unknown,
+        source_detail: ptr::null(),
+        confidence: 0.0,
+    };
+
+    let (has_frame_rate_exact, frame_rate_exact) = match track.frame_rate_exact {
+        Some(fr) => (true, frame_rate_to_c(fr)),
+        None => (false, zero_rate),
+    };
+
+    let detail_ptr = info_handle.timecode_source_details[index as usize].as_ptr();
+    let (has_start_timecode, start_timecode) = match track.start_timecode.as_ref() {
+        Some(tc) => (true, timecode_to_c(tc, detail_ptr)),
+        None => (false, zero_tc),
+    };
+
     unsafe {
         (*out_track).index = track.index;
         (*out_track).codec_name = info_handle.codec_names[index as usize].as_ptr();
@@ -775,9 +866,42 @@ pub extern "C" fn cyb_media_info_get_video_track(
         (*out_track).frame_rate = track.frame_rate;
         (*out_track).bit_rate = track.bit_rate;
         (*out_track).is_hardware_decodable = track.is_hardware_decodable;
+        (*out_track).has_frame_rate_exact = has_frame_rate_exact;
+        (*out_track).frame_rate_exact = frame_rate_exact;
+        (*out_track).has_start_timecode = has_start_timecode;
+        (*out_track).start_timecode = start_timecode;
     }
 
     CybResult::Success
+}
+
+fn frame_rate_to_c(fr: FrameRate) -> CybFrameRate {
+    CybFrameRate {
+        num: fr.num,
+        den: fr.den,
+    }
+}
+
+fn source_kind_to_c(kind: TimecodeSourceKind) -> CybTimecodeSourceKind {
+    match kind {
+        TimecodeSourceKind::TmcdTrack => CybTimecodeSourceKind::TmcdTrack,
+        TimecodeSourceKind::MxfMaterialPackage => CybTimecodeSourceKind::MxfMaterialPackage,
+        TimecodeSourceKind::MxfSourcePackage => CybTimecodeSourceKind::MxfSourcePackage,
+        TimecodeSourceKind::ContainerMetadata => CybTimecodeSourceKind::ContainerMetadata,
+        TimecodeSourceKind::Inferred => CybTimecodeSourceKind::Inferred,
+        TimecodeSourceKind::Unknown => CybTimecodeSourceKind::Unknown,
+    }
+}
+
+fn timecode_to_c(tc: &Timecode, source_detail: *const c_char) -> CybTimecode {
+    CybTimecode {
+        frame_number: tc.frame_number,
+        rate: frame_rate_to_c(tc.rate),
+        drop_frame: tc.drop_frame,
+        source_kind: source_kind_to_c(tc.source_kind),
+        source_detail,
+        confidence: tc.confidence,
+    }
 }
 
 /// Get audio track info

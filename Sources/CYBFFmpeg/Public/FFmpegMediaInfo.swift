@@ -67,6 +67,171 @@ public struct FFmpegMediaInfo: Sendable {
     }
 }
 
+// MARK: - FFmpegFrameRate
+
+/// Lossless rational frame rate (e.g., `24000/1001` for 23.976 fps).
+///
+/// Use this instead of `Double` when SMPTE timecode arithmetic matters —
+/// converting an NTSC rate via `Double` discards the `1/24000s` precision
+/// needed for frame-accurate calculations.
+public struct FFmpegFrameRate: Sendable, Codable, Equatable, Hashable {
+    /// Numerator (e.g., `24000`).
+    public let numerator: UInt32
+    /// Denominator (e.g., `1001`).
+    public let denominator: UInt32
+
+    public init(numerator: UInt32, denominator: UInt32) {
+        self.numerator = numerator
+        self.denominator = denominator
+    }
+
+    /// Approximate `Double` representation. Lossy for NTSC rates.
+    public var asDouble: Double {
+        guard denominator > 0 else { return 0 }
+        return Double(numerator) / Double(denominator)
+    }
+
+    /// Whether this is an NTSC (drop-frame–capable) rate.
+    public var isNTSC: Bool { denominator == 1001 }
+}
+
+// MARK: - FFmpegTimecodeSourceKind
+
+/// Where an embedded SMPTE timecode was sourced from.
+public enum FFmpegTimecodeSourceKind: UInt8, Sendable, Codable {
+    /// AVFoundation timecode track (`tmcd`) — high-confidence.
+    case tmcdTrack = 0
+    /// MXF MaterialPackage timecode — high-confidence for Sony / Panasonic / etc.
+    case mxfMaterialPackage = 1
+    /// MXF SourcePackage timecode — original camera TC, separate from material.
+    case mxfSourcePackage = 2
+    /// Container-level metadata `timecode` tag (MOV/MP4/etc.).
+    case containerMetadata = 3
+    /// No embedded TC found — value was inferred from frame rate.
+    case inferred = 4
+    /// Unknown source.
+    case unknown = 5
+}
+
+// MARK: - FFmpegTimecode
+
+/// Embedded SMPTE timecode read from a media file.
+///
+/// Canonical representation is the 5-tuple
+/// `(frameNumber, rate, dropFrame, sourceKind, confidence)`. Frame
+/// number is the absolute integer frame count from `00:00:00:00`,
+/// preserving SMPTE 12M drop-frame arithmetic exactly. `displayString`
+/// and `seconds` are derived (and lossy in the case of `seconds`).
+public struct FFmpegTimecode: Sendable, Codable, Equatable, Hashable {
+    /// Absolute frame count from `00:00:00:00`.
+    public let frameNumber: Int64
+    /// Exact frame rate.
+    public let rate: FFmpegFrameRate
+    /// True for 29.97 / 59.94 drop-frame timecode.
+    public let dropFrame: Bool
+    /// Where the timecode was sourced from.
+    public let sourceKind: FFmpegTimecodeSourceKind
+    /// Free-form provenance (e.g., `"ffmpeg:mxf:format:timecode"`).
+    public let sourceDetail: String
+    /// Confidence in the value, `0.0...1.0`.
+    public let confidence: Float
+
+    public init(
+        frameNumber: Int64,
+        rate: FFmpegFrameRate,
+        dropFrame: Bool,
+        sourceKind: FFmpegTimecodeSourceKind,
+        sourceDetail: String,
+        confidence: Float
+    ) {
+        self.frameNumber = frameNumber
+        self.rate = rate
+        self.dropFrame = dropFrame
+        self.sourceKind = sourceKind
+        self.sourceDetail = sourceDetail
+        self.confidence = confidence
+    }
+
+    /// Best-effort `HH:MM:SS:FF` (NDF) / `HH:MM:SS;FF` (DF) display string.
+    ///
+    /// Uses SMPTE 12M label-rate arithmetic (23.976 NDF labels as 24fps,
+    /// 29.97 DF as 30fps with the standard frame drops). Always returns
+    /// a positive-time string; negative `frameNumber` is clamped to 0.
+    public var displayString: String {
+        let tcRate = SMPTEArithmetic.tcIntegerRate(rate)
+        let (h, m, s, f) = SMPTEArithmetic.framesToComponents(
+            max(frameNumber, 0),
+            rate: tcRate,
+            dropFrame: dropFrame
+        )
+        let sep = dropFrame ? ";" : ":"
+        return String(format: "%02d:%02d:%02d%@%02d", h, m, s, sep, f)
+    }
+
+    /// Seconds equivalent. Lossy for NTSC rates — prefer `frameNumber`
+    /// for arithmetic.
+    public var seconds: Double {
+        guard rate.numerator > 0 else { return 0 }
+        return Double(frameNumber) * Double(rate.denominator) / Double(rate.numerator)
+    }
+}
+
+// MARK: - SMPTEArithmetic (internal)
+
+/// Pure-Swift mirror of the Rust `frames_to_smpte_components` /
+/// `tc_integer_rate` helpers. Lives in the framework so display
+/// strings can be formatted without crossing the FFI boundary.
+internal enum SMPTEArithmetic {
+    /// SMPTE clock label rate. NTSC family collapses to its integer
+    /// rate (23.976 → 24, 29.97 → 30, 59.94 → 60); other rates keep
+    /// `num/den`.
+    static func tcIntegerRate(_ rate: FFmpegFrameRate) -> UInt32 {
+        if rate.denominator == 1001 {
+            return rate.numerator / 1000
+        }
+        if rate.denominator == 0 { return 30 }
+        return rate.numerator / rate.denominator
+    }
+
+    /// SMPTE 12M frame-number → `(h, m, s, f)`.
+    static func framesToComponents(
+        _ frames: Int64,
+        rate: UInt32,
+        dropFrame: Bool
+    ) -> (Int, Int, Int, Int) {
+        precondition(rate > 0, "rate must be positive")
+        let r = Int64(rate)
+        let frameNumber: Int64
+        if dropFrame {
+            // SMPTE 12M DF: drop 2 frames per minute except every 10th, for
+            // 29.97 family (rate=30); 4-per-min except every 10th, for 59.94
+            // family (rate=60).
+            let dropPerMinute: Int64 = (rate == 60) ? 4 : 2
+            let framesPer10Min = r * 60 * 10 - 9 * dropPerMinute
+            let framesPerMin = r * 60 - dropPerMinute
+            let d = frames / framesPer10Min
+            let m = frames % framesPer10Min
+            if m > dropPerMinute {
+                frameNumber = frames
+                    + dropPerMinute * 9 * d
+                    + dropPerMinute * ((m - dropPerMinute) / framesPerMin)
+            } else {
+                frameNumber = frames + dropPerMinute * 9 * d
+            }
+        } else {
+            frameNumber = frames
+        }
+
+        let f = Int(frameNumber % r)
+        let totalSeconds = frameNumber / r
+        let s = Int(totalSeconds % 60)
+        let totalMinutes = totalSeconds / 60
+        let m = Int(totalMinutes % 60)
+        let h = Int(totalMinutes / 60)
+        return (h, m, s, f)
+    }
+}
+
 // MARK: - FFmpegVideoTrack
 
 /// Video track information
@@ -83,8 +248,18 @@ public struct FFmpegVideoTrack: Sendable {
     /// Video height in pixels
     public let height: Int
 
-    /// Frame rate (frames per second)
+    /// Frame rate (frames per second). Lossy for NTSC family — prefer
+    /// `frameRateExact` when present.
     public let frameRate: Double
+
+    /// Lossless rational frame rate (e.g., `24000/1001`). `nil` when
+    /// FFmpeg returned an unknown / zero `avg_frame_rate`.
+    public let frameRateExact: FFmpegFrameRate?
+
+    /// Embedded SMPTE start timecode if the container exposed one.
+    /// `nil` when no `timecode` tag was found at the stream or format
+    /// level.
+    public let startTimecode: FFmpegTimecode?
 
     /// Bit rate in bits per second (if available)
     public let bitRate: Int64?

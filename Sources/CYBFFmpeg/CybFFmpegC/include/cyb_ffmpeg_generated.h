@@ -27,6 +27,18 @@ typedef enum CybResult {
     CYB_RESULT_ERROR_UNKNOWN = 99,
 } CybResult;
 
+// Source kind for an embedded SMPTE timecode. Mirrors
+// [`crate::decoder::TimecodeSourceKind`].
+enum CybTimecodeSourceKind {
+    CYB_TIMECODE_SOURCE_KIND_TMCD_TRACK = 0,
+    CYB_TIMECODE_SOURCE_KIND_MXF_MATERIAL_PACKAGE = 1,
+    CYB_TIMECODE_SOURCE_KIND_MXF_SOURCE_PACKAGE = 2,
+    CYB_TIMECODE_SOURCE_KIND_CONTAINER_METADATA = 3,
+    CYB_TIMECODE_SOURCE_KIND_INFERRED = 4,
+    CYB_TIMECODE_SOURCE_KIND_UNKNOWN = 5,
+};
+typedef uint8_t CybTimecodeSourceKind;
+
 // Opaque audio frame handle (owns the data)
 typedef struct CybAudioFrameHandle CybAudioFrameHandle;
 
@@ -99,6 +111,32 @@ typedef struct CybMediaInfo {
     int32_t audio_track_count;
 } CybMediaInfo;
 
+// Exact frame rate as a rational number (`num / den`). Mirrors
+// [`crate::decoder::FrameRate`].
+typedef struct CybFrameRate {
+    uint32_t num;
+    uint32_t den;
+} CybFrameRate;
+
+// Embedded SMPTE timecode. Mirrors [`crate::decoder::Timecode`].
+//
+// `source_detail` points into a CString stored inside the owning
+// `CybMediaInfoHandle`; do not free or outlive the handle.
+typedef struct CybTimecode {
+    // Absolute frame number (canonical lossless representation).
+    int64_t frame_number;
+    // Exact frame rate.
+    struct CybFrameRate rate;
+    // True if drop-frame timecode (29.97 / 59.94 family).
+    bool drop_frame;
+    // Where the timecode was sourced from.
+    CybTimecodeSourceKind source_kind;
+    // Free-form provenance string (e.g., "ffmpeg:mxf:format:timecode").
+    const char *source_detail;
+    // Confidence in the value, 0.0..=1.0.
+    float confidence;
+} CybTimecode;
+
 // Video track info for FFI
 typedef struct CybVideoTrack {
     int32_t index;
@@ -106,9 +144,20 @@ typedef struct CybVideoTrack {
     const char *codec_long_name;
     int32_t width;
     int32_t height;
+    // Approximate frame rate, lossy for NTSC family. Use `frame_rate_exact`
+    // when `has_frame_rate_exact` is true for a lossless rational.
     double frame_rate;
     int64_t bit_rate;
     bool is_hardware_decodable;
+    // Whether `frame_rate_exact` carries a meaningful value.
+    bool has_frame_rate_exact;
+    // Lossless rational frame rate (24000/1001 etc.). Only valid when
+    // `has_frame_rate_exact` is true.
+    struct CybFrameRate frame_rate_exact;
+    // Whether `start_timecode` carries a meaningful value.
+    bool has_start_timecode;
+    // Embedded SMPTE timecode. Only valid when `has_start_timecode` is true.
+    struct CybTimecode start_timecode;
 } CybVideoTrack;
 
 // Audio track info for FFI

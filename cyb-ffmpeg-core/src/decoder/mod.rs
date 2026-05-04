@@ -16,12 +16,14 @@ mod audio_frame;
 pub(crate) mod config;
 pub(crate) mod ffmpeg_decoder;
 mod frame;
-mod info;
+pub mod info;
 
 pub use audio_frame::{AudioFrame, SampleFormat};
 pub use config::{DecoderConfig, PixelFormat};
 pub use frame::VideoFrame;
-pub use info::{AudioTrack, CodecInfo, MediaInfo, VideoTrack};
+pub use info::{
+    AudioTrack, CodecInfo, FrameRate, MediaInfo, Timecode, TimecodeSourceKind, VideoTrack,
+};
 
 use ffmpeg_decoder::FFmpegContext;
 

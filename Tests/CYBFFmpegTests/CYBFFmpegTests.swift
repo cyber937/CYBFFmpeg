@@ -129,6 +129,8 @@ final class CYBFFmpegTests: XCTestCase {
             width: 1920,
             height: 1080,
             frameRate: 30.0,
+            frameRateExact: nil,
+            startTimecode: nil,
             bitRate: 5_000_000,
             pixelFormat: "yuv420p",
             isHardwareDecodable: true,

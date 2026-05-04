@@ -18,7 +18,10 @@ use ffmpeg_next::Rational;
 use super::audio_frame::AudioFrame;
 use super::config::{DecoderConfig, PixelFormat};
 use super::frame::{VideoFrame, CFRetain};
-use super::info::{AudioTrack, CodecInfo, MediaInfo, VideoTrack};
+use super::info::{
+    parse_smpte_string, AudioTrack, CodecInfo, FrameRate, MediaInfo, Timecode, TimecodeSourceKind,
+    VideoTrack,
+};
 use crate::error::{Error, Result};
 
 /// `AVCodecContext::get_format` callback. H.264 calls this lazily, after
@@ -854,6 +857,25 @@ impl FFmpegContext {
             metadata.insert(key.to_string(), value.to_string());
         }
 
+        // Container format is needed early to classify timecode source
+        // (MXF stream-level "timecode" tag corresponds to the MaterialPackage TC).
+        let container_format = self
+            .input
+            .format()
+            .name()
+            .split(',')
+            .next()
+            .unwrap_or("unknown")
+            .to_string();
+
+        // Format-level "timecode" fallback (some muxers store TC here, not on
+        // the video stream).
+        let format_level_timecode = self
+            .input
+            .metadata()
+            .get("timecode")
+            .map(|s| s.to_string());
+
         // Process video streams
         for stream in self.input.streams() {
             let params = stream.parameters();
@@ -878,6 +900,37 @@ impl FFmpegContext {
                     0.0
                 };
 
+                // Build exact rational FrameRate (for SMPTE timecode arithmetic
+                // and consumers that need lossless 24000/1001 etc.).
+                let frame_rate_exact = if frame_rate.denominator() > 0
+                    && frame_rate.numerator() > 0
+                {
+                    FrameRate::new(
+                        frame_rate.numerator() as u32,
+                        frame_rate.denominator() as u32,
+                    )
+                } else {
+                    None
+                };
+
+                // Try to extract embedded SMPTE timecode. Prefer the per-stream
+                // `timecode` tag (where most muxers, including FFmpeg's MXF
+                // demuxer, surface MaterialPackage TC); fall back to format
+                // level if absent.
+                let stream_level_timecode = stream
+                    .metadata()
+                    .get("timecode")
+                    .map(|s| s.to_string());
+
+                let start_timecode = frame_rate_exact.and_then(|fr| {
+                    extract_video_timecode(
+                        stream_level_timecode.as_deref(),
+                        format_level_timecode.as_deref(),
+                        fr,
+                        &container_format,
+                    )
+                });
+
                 let video_track = VideoTrack {
                     index: stream.index() as i32,
                     codec: codec_info,
@@ -891,6 +944,8 @@ impl FFmpegContext {
                     color_primaries: None,
                     color_transfer: None,
                     color_range: "unknown".to_string(),
+                    frame_rate_exact,
+                    start_timecode,
                 };
 
                 video_tracks.push(video_track);
@@ -922,16 +977,6 @@ impl FFmpegContext {
                 audio_tracks.push(audio_track);
             }
         }
-
-        // Get container format
-        let container_format = self
-            .input
-            .format()
-            .name()
-            .split(',')
-            .next()
-            .unwrap_or("unknown")
-            .to_string();
 
         // Calculate duration
         let duration = if self.duration_us > 0 {
@@ -2369,6 +2414,60 @@ impl FFmpegContext {
     }
 }
 
+/// Try to build a [`Timecode`] from the per-stream and format-level "timecode"
+/// metadata tags. Returns `None` when no usable tag exists.
+///
+/// Source classification:
+/// * `mxf` container, stream-level tag → [`TimecodeSourceKind::MxfMaterialPackage`]
+///   (FFmpeg's MXF demuxer surfaces the MaterialPackage TC on the video stream).
+/// * `mxf` container, format-level tag → [`TimecodeSourceKind::MxfMaterialPackage`]
+///   as well, since that's still where the material package TC lives.
+/// * Other container, stream- or format-level tag → [`TimecodeSourceKind::ContainerMetadata`].
+///
+/// Confidence is set to 0.95 for explicit MXF / stream-level tags, 0.85 for
+/// format-level fallback. Drop-frame is inferred from the separator (`;` → DF,
+/// `:` → NDF) but a downstream layer can override.
+fn extract_video_timecode(
+    stream_tag: Option<&str>,
+    format_tag: Option<&str>,
+    frame_rate: FrameRate,
+    container_format: &str,
+) -> Option<Timecode> {
+    let is_mxf = container_format.eq_ignore_ascii_case("mxf");
+
+    // Pick the strongest available source.
+    let (raw_tag, on_stream) = match (stream_tag, format_tag) {
+        (Some(s), _) => (s, true),
+        (None, Some(s)) => (s, false),
+        (None, None) => return None,
+    };
+
+    let frame_number = parse_smpte_string(raw_tag, frame_rate, None)?;
+    let drop_frame = raw_tag.contains(';');
+
+    let (source_kind, confidence) = match (is_mxf, on_stream) {
+        (true, true) => (TimecodeSourceKind::MxfMaterialPackage, 0.95),
+        (true, false) => (TimecodeSourceKind::MxfMaterialPackage, 0.90),
+        (false, true) => (TimecodeSourceKind::ContainerMetadata, 0.90),
+        (false, false) => (TimecodeSourceKind::ContainerMetadata, 0.80),
+    };
+
+    let source_detail = format!(
+        "ffmpeg:{}:{}",
+        container_format,
+        if on_stream { "stream:timecode" } else { "format:timecode" }
+    );
+
+    Some(Timecode {
+        frame_number,
+        rate: frame_rate,
+        drop_frame,
+        source_kind,
+        source_detail,
+        confidence,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2386,6 +2485,77 @@ mod tests {
         assert_eq!(pts, 90000);
     }
 
+    // -- extract_video_timecode -----------------------------------------------
+
+    #[test]
+    fn extract_video_timecode_returns_none_when_no_tags() {
+        let rate = FrameRate::new(24000, 1001).unwrap();
+        assert!(extract_video_timecode(None, None, rate, "mxf").is_none());
+        assert!(extract_video_timecode(None, None, rate, "mov").is_none());
+    }
+
+    #[test]
+    fn extract_video_timecode_mxf_stream_level_classified_as_material_package() {
+        let rate = FrameRate::new(24000, 1001).unwrap();
+        let tc = extract_video_timecode(Some("12:34:56:00"), None, rate, "mxf")
+            .expect("should parse");
+        assert_eq!(tc.frame_number, 1_087_104);
+        assert_eq!(tc.source_kind, TimecodeSourceKind::MxfMaterialPackage);
+        assert!(!tc.drop_frame);
+        assert!(tc.confidence >= 0.9);
+        assert!(tc.source_detail.contains("mxf"));
+        assert!(tc.source_detail.contains("stream"));
+    }
+
+    #[test]
+    fn extract_video_timecode_mxf_format_level_fallback() {
+        let rate = FrameRate::new(24000, 1001).unwrap();
+        let tc = extract_video_timecode(None, Some("01:00:00:00"), rate, "mxf")
+            .expect("should parse");
+        assert_eq!(tc.frame_number, 86_400);
+        assert_eq!(tc.source_kind, TimecodeSourceKind::MxfMaterialPackage);
+        assert!(tc.source_detail.contains("format"));
+    }
+
+    #[test]
+    fn extract_video_timecode_mov_classified_as_container_metadata() {
+        let rate = FrameRate::new(30, 1).unwrap();
+        let tc = extract_video_timecode(Some("00:01:00:00"), None, rate, "mov")
+            .expect("should parse");
+        assert_eq!(tc.frame_number, 1_800);
+        assert_eq!(tc.source_kind, TimecodeSourceKind::ContainerMetadata);
+    }
+
+    #[test]
+    fn extract_video_timecode_drop_frame_via_semicolon() {
+        let rate = FrameRate::new(30000, 1001).unwrap();
+        let tc = extract_video_timecode(Some("01:00:00;00"), None, rate, "mxf")
+            .expect("should parse DF");
+        assert!(tc.drop_frame);
+        assert_eq!(tc.frame_number, 107_892);
+    }
+
+    #[test]
+    fn extract_video_timecode_prefers_stream_over_format() {
+        // Stream-level wins; format-level value should be ignored.
+        let rate = FrameRate::new(24, 1).unwrap();
+        let tc = extract_video_timecode(
+            Some("01:00:00:00"),
+            Some("02:00:00:00"),
+            rate,
+            "mxf",
+        )
+        .expect("should parse");
+        assert_eq!(tc.frame_number, 86_400); // 01:00:00:00 @ 24fps
+    }
+
+    #[test]
+    fn extract_video_timecode_rejects_malformed_string() {
+        let rate = FrameRate::new(24, 1).unwrap();
+        assert!(extract_video_timecode(Some("garbage"), None, rate, "mxf").is_none());
+        assert!(extract_video_timecode(Some(""), None, rate, "mxf").is_none());
+    }
+
     #[test]
     fn test_pixel_format_conversion() {
         assert_eq!(
@@ -2395,6 +2565,53 @@ mod tests {
         assert_eq!(
             FFmpegContext::pixel_format_to_ffmpeg(PixelFormat::Nv12),
             ffmpeg::format::Pixel::NV12
+        );
+    }
+
+    /// Integration test: get_media_info should not crash on the bundled MXF
+    /// sample even when no embedded timecode tag is present, and should
+    /// populate `frame_rate_exact` from `avg_frame_rate`.
+    #[test]
+    fn test_get_media_info_mxf_sample_frame_rate_exact() {
+        let _ = env_logger::builder()
+            .filter_level(log::LevelFilter::Debug)
+            .is_test(true)
+            .try_init();
+
+        let sample_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("samples/sample_1280x720_surfing_with_audio.mxf");
+
+        if !sample_path.exists() {
+            eprintln!("Skipping test: sample file not found at {:?}", sample_path);
+            return;
+        }
+
+        let config = DecoderConfig::default();
+        let ctx = FFmpegContext::new(&sample_path, &config)
+            .expect("Failed to create FFmpegContext");
+
+        let info = ctx.get_media_info().expect("get_media_info");
+        let video = info
+            .primary_video()
+            .expect("expected at least one video track");
+
+        // Sample is 24 fps progressive (per ffprobe). frame_rate_exact must
+        // be present and match.
+        assert!(
+            video.frame_rate_exact.is_some(),
+            "frame_rate_exact must be populated for a non-zero avg_frame_rate"
+        );
+        let fr = video.frame_rate_exact.unwrap();
+        assert!(fr.den > 0, "denominator must be non-zero");
+        assert!(fr.num > 0, "numerator must be non-zero");
+
+        // The sample doesn't carry an embedded timecode in its MaterialPackage,
+        // but the call must not fail and should leave start_timecode None.
+        eprintln!(
+            "MXF sample: frame_rate_exact={}/{}, start_timecode={:?}",
+            fr.num, fr.den, video.start_timecode
         );
     }
 
