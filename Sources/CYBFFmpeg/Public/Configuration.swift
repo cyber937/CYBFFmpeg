@@ -21,6 +21,18 @@ public struct DecoderConfiguration: Sendable {
     /// Output pixel format for decoded frames
     public let outputPixelFormat: PixelFormat
 
+    /// When `true`, `prepare()` skips the up-front keyframe-index scan.
+    ///
+    /// The index enables byte-precise seeks; building it walks the entire
+    /// video stream and can take 20+ seconds on cold 4K MXF I/O. Set to
+    /// `true` when the decoder is created purely for metadata / timecode
+    /// extraction and will not be used for seek or playback. The timecode
+    /// tag is available immediately after stream-info read, so this makes
+    /// a probe-only flow ~20× faster.
+    ///
+    /// Default `false` preserves playback behavior for existing callers.
+    public let skipKeyframeIndexing: Bool
+
     // MARK: Initialization
 
     /// Create a custom configuration
@@ -28,12 +40,14 @@ public struct DecoderConfiguration: Sendable {
         preferHardwareDecoding: Bool = true,
         cacheConfiguration: CacheConfiguration = .default,
         threadCount: Int = 0,
-        outputPixelFormat: PixelFormat = .nv12
+        outputPixelFormat: PixelFormat = .nv12,
+        skipKeyframeIndexing: Bool = false
     ) {
         self.preferHardwareDecoding = preferHardwareDecoding
         self.cacheConfiguration = cacheConfiguration
         self.threadCount = threadCount
         self.outputPixelFormat = outputPixelFormat
+        self.skipKeyframeIndexing = skipKeyframeIndexing
     }
 
     // MARK: Presets
@@ -63,6 +77,17 @@ public struct DecoderConfiguration: Sendable {
         cacheConfiguration: .scrubbing,
         threadCount: 0,
         outputPixelFormat: .nv12
+    )
+
+    /// Metadata-only configuration — skips the keyframe index for fast
+    /// probes that will not seek or play back. The decoder is expected
+    /// to be discarded immediately after reading `mediaInfo`.
+    public static let metadataOnly = DecoderConfiguration(
+        preferHardwareDecoding: false,
+        cacheConfiguration: .disabled,
+        threadCount: 1,
+        outputPixelFormat: .nv12,
+        skipKeyframeIndexing: true
     )
 }
 

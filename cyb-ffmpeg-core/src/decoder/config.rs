@@ -44,6 +44,20 @@ pub struct DecoderConfig {
 
     /// Output pixel format
     pub output_pixel_format: PixelFormat,
+
+    /// When true, `Decoder::prepare()` skips the up-front keyframe-index
+    /// scan. The index enables byte-precise seeks (used internally by
+    /// `seek_precise`); building it requires walking the entire video
+    /// stream once, which can take 20+ seconds on cold 4K MXF I/O.
+    ///
+    /// Use this when the decoder is created purely for metadata/timecode
+    /// extraction and will be discarded without any seek/playback. The
+    /// timecode tag lives on format/stream metadata and is available
+    /// immediately after `find_stream_info`, so a probe-only flow is
+    /// ~20× faster with this set.
+    ///
+    /// Default `false` to preserve playback behavior for existing callers.
+    pub skip_keyframe_indexing: bool,
 }
 
 impl Default for DecoderConfig {
@@ -56,6 +70,7 @@ impl Default for DecoderConfig {
             enable_prefetch: true,
             thread_count: 0,
             output_pixel_format: PixelFormat::Nv12,
+            skip_keyframe_indexing: false,
         }
     }
 }
@@ -71,6 +86,7 @@ impl DecoderConfig {
             enable_prefetch: true,
             thread_count: 0,
             output_pixel_format: PixelFormat::Nv12,
+            skip_keyframe_indexing: false,
         }
     }
 
@@ -84,6 +100,7 @@ impl DecoderConfig {
             enable_prefetch: false,
             thread_count: 2,
             output_pixel_format: PixelFormat::Nv12,
+            skip_keyframe_indexing: false,
         }
     }
 
@@ -97,6 +114,24 @@ impl DecoderConfig {
             enable_prefetch: true,
             thread_count: 0,
             output_pixel_format: PixelFormat::Nv12,
+            skip_keyframe_indexing: false,
+        }
+    }
+
+    /// Metadata-only preset — skips the keyframe index for fast probes that
+    /// will not perform any seek or playback. Cache sizes are set to zero
+    /// because the decoder is expected to be discarded immediately after
+    /// reading metadata.
+    pub fn metadata_only() -> Self {
+        Self {
+            prefer_hardware_decoding: false,
+            l1_cache_capacity: 0,
+            l2_cache_capacity: 0,
+            l3_cache_capacity: 0,
+            enable_prefetch: false,
+            thread_count: 1,
+            output_pixel_format: PixelFormat::Nv12,
+            skip_keyframe_indexing: true,
         }
     }
 }
@@ -120,5 +155,19 @@ mod tests {
 
         let low = DecoderConfig::low_memory();
         assert!(!low.enable_prefetch);
+    }
+
+    #[test]
+    fn test_metadata_only_preset_skips_keyframe_indexing() {
+        let metadata = DecoderConfig::metadata_only();
+        assert!(metadata.skip_keyframe_indexing);
+        assert_eq!(metadata.l1_cache_capacity, 0);
+        assert!(!metadata.enable_prefetch);
+    }
+
+    #[test]
+    fn test_default_does_not_skip_indexing() {
+        let cfg = DecoderConfig::default();
+        assert!(!cfg.skip_keyframe_indexing);
     }
 }

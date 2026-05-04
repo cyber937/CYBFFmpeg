@@ -109,14 +109,24 @@ impl Decoder {
         // Extract media info
         let media_info = ctx.get_media_info()?;
 
-        // Build keyframe index for fast seeking (synchronous during prepare)
-        // Limit to 2000 entries to prevent excessive memory usage on very long videos
-        let keyframe_count = ctx.build_keyframe_index(2000).unwrap_or_else(|e| {
-            log::warn!("Failed to build keyframe index: {:?}", e);
-            0
-        });
-        if keyframe_count > 0 {
-            log::info!("Built keyframe index with {} entries", keyframe_count);
+        // Build keyframe index for fast seeking (synchronous during prepare).
+        // Limit to 2000 entries to prevent excessive memory usage on very
+        // long videos.
+        //
+        // Callers that only need metadata (e.g. probing a Sony FS7 MXF for
+        // its source timecode and immediately discarding the decoder) can
+        // set `config.skip_keyframe_indexing = true` to avoid the full
+        // stream walk, which is expensive on cold 4K MXF I/O.
+        if !self.config.skip_keyframe_indexing {
+            let keyframe_count = ctx.build_keyframe_index(2000).unwrap_or_else(|e| {
+                log::warn!("Failed to build keyframe index: {:?}", e);
+                0
+            });
+            if keyframe_count > 0 {
+                log::info!("Built keyframe index with {} entries", keyframe_count);
+            }
+        } else {
+            log::info!("Skipping keyframe index build (metadata-only prepare)");
         }
 
         // Store context and info

@@ -503,7 +503,8 @@ extension DecoderConfiguration {
             prefer_hardware_decoding: preferHardwareDecoding,
             cache_config: cacheConfiguration.toCybConfig(),
             thread_count: UInt32(threadCount),
-            output_pixel_format: outputPixelFormat.toCybFormat()
+            output_pixel_format: outputPixelFormat.toCybFormat(),
+            skip_keyframe_indexing: skipKeyframeIndexing
         )
     }
 }
