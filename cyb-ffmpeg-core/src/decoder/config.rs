@@ -45,32 +45,17 @@ pub struct DecoderConfig {
     /// Output pixel format
     pub output_pixel_format: PixelFormat,
 
-    /// When true, `Decoder::prepare()` skips the up-front keyframe-index
-    /// scan. The index enables byte-precise seeks (used internally by
-    /// `seek_precise`); building it requires walking the entire video
-    /// stream once, which can take 20+ seconds on cold 4K MXF I/O.
-    ///
-    /// Use this when the decoder is created purely for metadata/timecode
-    /// extraction and will be discarded without any seek/playback. The
-    /// timecode tag lives on format/stream metadata and is available
-    /// immediately after `find_stream_info`, so a probe-only flow is
-    /// ~20× faster with this set.
-    ///
-    /// Default `false` to preserve playback behavior for existing callers.
+    /// **Deprecated, no-op.** Used to gate an up-front keyframe-index
+    /// scan in `Decoder::prepare()`. That scan was removed because it
+    /// duplicated work FFmpeg's demuxer already does internally (via
+    /// container-native indexes — MXF Index Table Segments, mp4 stss,
+    /// etc.). Retained as a struct field for ABI / API stability.
     pub skip_keyframe_indexing: bool,
 
-    /// Optional path to a disk cache file for the keyframe index.
-    ///
-    /// When set, `Decoder::prepare()` will:
-    /// 1. Try to load a previously-saved index from this path. The cache
-    ///    file embeds the source file's `(size, mtime_secs)` and is
-    ///    rejected if either differs from the current source file.
-    /// 2. On cache miss, build the index normally and write it to this
-    ///    path before returning, so subsequent calls hit the cache.
-    ///
-    /// Skipped entirely when `skip_keyframe_indexing` is `true`.
-    ///
-    /// Default `None` preserves current behavior (always rebuild).
+    /// **Deprecated, no-op.** Used to point at a disk cache file for
+    /// the custom keyframe index. The custom index has been removed
+    /// (see `skip_keyframe_indexing`), so there is nothing to cache.
+    /// Retained as a struct field for ABI / API stability.
     pub keyframe_index_cache_path: Option<String>,
 }
 
@@ -136,10 +121,14 @@ impl DecoderConfig {
         }
     }
 
-    /// Metadata-only preset — skips the keyframe index for fast probes that
-    /// will not perform any seek or playback. Cache sizes are set to zero
-    /// because the decoder is expected to be discarded immediately after
-    /// reading metadata.
+    /// Metadata-only preset — minimal-footprint config for callers that
+    /// open a decoder purely to read media info / timecode and then
+    /// discard it (no seek, no playback, no frame decode). Sets cache
+    /// sizes to zero, disables prefetch, and limits the codec to one
+    /// thread. Now that the up-front keyframe-index scan has been
+    /// removed, the speed difference vs `default()` is small, but this
+    /// preset still avoids allocating a frame cache and a prefetch
+    /// pool that the caller would never use.
     pub fn metadata_only() -> Self {
         Self {
             prefer_hardware_decoding: false,

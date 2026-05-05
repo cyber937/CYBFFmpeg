@@ -125,9 +125,6 @@ pub struct FFmpegContext {
     /// Queue of video packets collected during audio decoding
     video_packet_queue: VecDeque<ffmpeg::Packet>,
 
-    /// Keyframe index for fast seeking (built during prepare)
-    keyframe_index: Option<KeyframeIndex>,
-
     /// Last returned PTS (microseconds). Used to assert that frames come out
     /// of `receive_frame` in display (monotonic) order after a seek.
     last_returned_pts_us: Option<i64>,
@@ -135,205 +132,6 @@ pub struct FFmpegContext {
     /// Number of frames remaining in the post-seek monotonicity check window.
     /// Set by every seek path; counts down inside `receive_frame`.
     monotonic_check_frames_remaining: u32,
-}
-
-/// Keyframe index for fast seeking
-///
-/// Stores (pts_us, byte_position) pairs for all keyframes in the video stream.
-/// Built during prepare() by scanning all packets.
-#[derive(Debug, Clone)]
-pub struct KeyframeIndex {
-    /// Sorted list of (pts_us, byte_position) pairs
-    entries: Vec<(i64, i64)>,
-}
-
-impl KeyframeIndex {
-    /// Create a new empty keyframe index
-    pub fn new() -> Self {
-        Self { entries: Vec::new() }
-    }
-
-    /// Number of keyframes in the index
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Check if the index is empty
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Add a keyframe entry
-    pub fn add(&mut self, pts_us: i64, byte_position: i64) {
-        self.entries.push((pts_us, byte_position));
-    }
-
-    /// Sort entries by PTS (should be called after building)
-    pub fn sort(&mut self) {
-        self.entries.sort_by_key(|(pts, _)| *pts);
-    }
-
-    /// Find the keyframe at or before the specified time using binary search
-    ///
-    /// Returns (pts_us, byte_position) of the keyframe, or None if no keyframe before the time.
-    pub fn find_keyframe_before(&self, pts_us: i64) -> Option<(i64, i64)> {
-        if self.entries.is_empty() {
-            return None;
-        }
-
-        // Binary search for the rightmost entry with pts <= target
-        match self.entries.binary_search_by_key(&pts_us, |(pts, _)| *pts) {
-            Ok(idx) => Some(self.entries[idx]),  // Exact match
-            Err(idx) => {
-                if idx == 0 {
-                    // All keyframes are after the target, use first one
-                    Some(self.entries[0])
-                } else {
-                    // Use the keyframe before the insertion point
-                    Some(self.entries[idx - 1])
-                }
-            }
-        }
-    }
-
-    /// Find the keyframe at or after the specified time using binary search
-    ///
-    /// Returns (pts_us, byte_position) of the keyframe, or None if no keyframe after the time.
-    pub fn find_keyframe_after(&self, pts_us: i64) -> Option<(i64, i64)> {
-        if self.entries.is_empty() {
-            return None;
-        }
-
-        match self.entries.binary_search_by_key(&pts_us, |(pts, _)| *pts) {
-            Ok(idx) => Some(self.entries[idx]),  // Exact match
-            Err(idx) => {
-                if idx >= self.entries.len() {
-                    None  // No keyframe after the target
-                } else {
-                    Some(self.entries[idx])
-                }
-            }
-        }
-    }
-
-    /// Save the index to disk, embedding the source file's (size, mtime)
-    /// so a later load can detect if the source file has changed.
-    ///
-    /// File format (little-endian, packed):
-    /// ```text
-    ///   [magic        4B] = "KFIX"
-    ///   [version     u32] = 1
-    ///   [src_size    u64] = source file byte size at build time
-    ///   [src_mtime   i64] = source file modification time, seconds since UNIX epoch
-    ///   [count       u32] = entry count
-    ///   [entries     ...] = (pts_us i64, byte_position i64) × count
-    /// ```
-    pub fn save_to_disk(
-        &self,
-        path: impl AsRef<std::path::Path>,
-        source_size: u64,
-        source_mtime_secs: i64,
-    ) -> std::io::Result<()> {
-        use std::io::Write;
-
-        if let Some(parent) = path.as_ref().parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Write to a temp file then rename, so a partial write never
-        // leaves a corrupt cache that load_from_disk would happily try
-        // to parse.
-        let tmp_path = path.as_ref().with_extension("kfix.tmp");
-        let mut f = std::fs::File::create(&tmp_path)?;
-
-        f.write_all(b"KFIX")?;
-        f.write_all(&1u32.to_le_bytes())?;
-        f.write_all(&source_size.to_le_bytes())?;
-        f.write_all(&source_mtime_secs.to_le_bytes())?;
-        let count = self.entries.len() as u32;
-        f.write_all(&count.to_le_bytes())?;
-        for (pts, pos) in &self.entries {
-            f.write_all(&pts.to_le_bytes())?;
-            f.write_all(&pos.to_le_bytes())?;
-        }
-        f.flush()?;
-        drop(f);
-        std::fs::rename(&tmp_path, path.as_ref())?;
-        Ok(())
-    }
-
-    /// Try to load an index previously saved by `save_to_disk`. Returns
-    /// `None` (not an error) when:
-    /// * the file does not exist,
-    /// * the magic / version doesn't match,
-    /// * the embedded `(size, mtime)` differs from the current source
-    ///   file (= source has changed since the index was built),
-    /// * the file is truncated or otherwise malformed.
-    ///
-    /// Any other I/O error is surfaced.
-    pub fn load_from_disk(
-        path: impl AsRef<std::path::Path>,
-        source_size: u64,
-        source_mtime_secs: i64,
-    ) -> std::io::Result<Option<Self>> {
-        use std::io::Read;
-
-        let mut f = match std::fs::File::open(path.as_ref()) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
-        };
-
-        let mut magic = [0u8; 4];
-        if f.read_exact(&mut magic).is_err() || &magic != b"KFIX" {
-            return Ok(None);
-        }
-        let mut buf32 = [0u8; 4];
-        if f.read_exact(&mut buf32).is_err() {
-            return Ok(None);
-        }
-        let version = u32::from_le_bytes(buf32);
-        if version != 1 {
-            return Ok(None);
-        }
-        let mut buf64 = [0u8; 8];
-        if f.read_exact(&mut buf64).is_err() {
-            return Ok(None);
-        }
-        let stored_size = u64::from_le_bytes(buf64);
-        if f.read_exact(&mut buf64).is_err() {
-            return Ok(None);
-        }
-        let stored_mtime = i64::from_le_bytes(buf64);
-
-        if stored_size != source_size || stored_mtime != source_mtime_secs {
-            return Ok(None);
-        }
-
-        if f.read_exact(&mut buf32).is_err() {
-            return Ok(None);
-        }
-        let count = u32::from_le_bytes(buf32) as usize;
-
-        // Sanity: 16 bytes per entry, refuse absurdly large headers.
-        if count > 10_000_000 {
-            return Ok(None);
-        }
-
-        let mut entries = Vec::with_capacity(count);
-        for _ in 0..count {
-            if f.read_exact(&mut buf64).is_err() {
-                return Ok(None);
-            }
-            let pts = i64::from_le_bytes(buf64);
-            if f.read_exact(&mut buf64).is_err() {
-                return Ok(None);
-            }
-            let pos = i64::from_le_bytes(buf64);
-            entries.push((pts, pos));
-        }
-
-        Ok(Some(Self { entries }))
-    }
 }
 
 impl FFmpegContext {
@@ -395,7 +193,6 @@ impl FFmpegContext {
             is_hw_decoder: false,
             audio_packet_queue: VecDeque::with_capacity(64),
             video_packet_queue: VecDeque::with_capacity(32),
-            keyframe_index: None,
             last_returned_pts_us: None,
             monotonic_check_frames_remaining: 0,
         };
@@ -649,10 +446,11 @@ impl FFmpegContext {
         // build forced `thread_type = FF_THREAD_SLICE` + `thread_count = 1`
         // as a (misdiagnosed) workaround for non-monotonic PTS after seek;
         // the real root cause was `AVSEEK_FLAG_BYTE` bypassing the demuxer's
-        // `read_seek2` callback in `seek_precise`, which broke H.264 DPB
-        // reorder bookkeeping (SPS/PPS not re-emitted, `num_reorder_frames`
-        // never re-inferred). That is now fixed in `seek_to_keyframe_timestamp`,
-        // so default threading is safe again.
+        // `read_seek2` callback, which broke H.264 DPB reorder bookkeeping
+        // (SPS/PPS not re-emitted, `num_reorder_frames` never re-inferred).
+        // `seek_precise` now goes through `avformat_seek_file` with `flags=0`
+        // (timestamp seek, container-aware path), so default threading is
+        // safe again.
         if config.thread_count > 0 {
             unsafe {
                 (*decoder_ctx.as_mut_ptr()).thread_count = config.thread_count as i32;
@@ -1114,149 +912,6 @@ impl FFmpegContext {
         })
     }
 
-    /// Seek directly to a byte position in the file.
-    ///
-    /// This is used by seek_precise() when a keyframe index is available,
-    /// allowing direct seeking to the exact byte position of a keyframe.
-    pub fn seek_to_byte_position(&mut self, byte_pos: i64) -> Result<()> {
-        log::info!("FFmpegContext::seek_to_byte_position - pos={}", byte_pos);
-
-        let byte_seek_result = unsafe {
-            ffmpeg::ffi::av_seek_frame(
-                self.input.as_mut_ptr(),
-                -1,
-                byte_pos,
-                ffmpeg::ffi::AVSEEK_FLAG_BYTE as i32,
-            )
-        };
-
-        if byte_seek_result < 0 {
-            log::warn!(
-                "FFmpegContext::seek_to_byte_position - av_seek_frame failed, trying avformat_seek_file"
-            );
-
-            // Try avformat_seek_file as fallback
-            let file_seek_result = unsafe {
-                ffmpeg::ffi::avformat_seek_file(
-                    self.input.as_mut_ptr(),
-                    -1,
-                    i64::MIN,
-                    byte_pos,
-                    byte_pos,
-                    ffmpeg::ffi::AVSEEK_FLAG_BYTE as i32,
-                )
-            };
-
-            if file_seek_result < 0 {
-                log::error!(
-                    "FFmpegContext::seek_to_byte_position - all methods failed for pos={}",
-                    byte_pos
-                );
-                return Err(Error::SeekFailed(byte_pos));
-            }
-        }
-
-        log::info!(
-            "FFmpegContext::seek_to_byte_position - seek succeeded to pos={}",
-            byte_pos
-        );
-
-        // Flush decoder buffers - critical after seek
-        if let Some(ref mut decoder) = self.video_decoder {
-            decoder.flush();
-        }
-        if let Some(ref mut decoder) = self.audio_decoder {
-            decoder.flush();
-        }
-
-        // Clear packet queues
-        self.audio_packet_queue.clear();
-        self.video_packet_queue.clear();
-
-        // Flush resampler
-        if let Some(ref mut resampler) = self.resampler {
-            let target_format = ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed);
-            let target_layout = ffmpeg::channel_layout::ChannelLayout::STEREO;
-            let mut flush_output = ffmpeg::frame::Audio::new(target_format, 4096, target_layout);
-            let _ = resampler.flush(&mut flush_output);
-        }
-
-        // Arm the post-seek monotonicity check.
-        self.last_returned_pts_us = None;
-        self.monotonic_check_frames_remaining = 30;
-
-        Ok(())
-    }
-
-    /// Stream-time-base timestamp seek that goes through the demuxer's
-    /// `read_seek2` callback (unlike `seek_to_byte_position` which uses
-    /// `AVSEEK_FLAG_BYTE` and bypasses container-aware seek). For MXF this
-    /// triggers edit-unit alignment + SPS/PPS in-band re-emission, which is
-    /// required for H.264 + VideoToolbox hwaccel to restore
-    /// `num_reorder_frames` and emit frames in display (monotonic PTS) order.
-    ///
-    /// Background: byte-position seek calls `seek_frame_byte` in
-    /// `libavformat/seek.c`, which intentionally bypasses the demuxer's
-    /// `read_seek2` callback. For containers that maintain non-trivial state
-    /// across edit units (MXF, MOV with fragments), this leaves the demuxer
-    /// in a state where the next packets fed to the H.264 decoder are
-    /// non-IDR slices with no preceding SPS/PPS. Without `bitstream_restriction_flag`
-    /// or fresh SPS, `num_reorder_frames` is never inferred, the H.264
-    /// front-end skips DPB-based reordering, and frames pass through in
-    /// decode order — observed on Sony FS7 H.264-in-MXF as a non-monotonic
-    /// PTS sequence after seek.
-    ///
-    /// `pts_us` is in microseconds (AV_TIME_BASE units). Pass the keyframe
-    /// PTS read from the keyframe index — the demuxer will land on the IDR
-    /// at or before that timestamp, but unlike `seek_to_byte_position` it
-    /// will run the container-aware seek path that re-establishes decoder
-    /// state.
-    pub fn seek_to_keyframe_timestamp(&mut self, pts_us: i64) -> Result<()> {
-        log::info!(
-            "FFmpegContext::seek_to_keyframe_timestamp - pts_us={}",
-            pts_us
-        );
-
-        // ffmpeg-next's high-level `seek` wraps `avformat_seek_file` with
-        // stream_idx=-1 (microseconds, AV_TIME_BASE_Q) and flags=0 — the
-        // container-aware path that triggers `read_seek2`.
-        if let Err(e) = self.input.seek(pts_us, ..pts_us) {
-            log::error!(
-                "FFmpegContext::seek_to_keyframe_timestamp - input.seek failed: {}",
-                e
-            );
-            return Err(Error::SeekFailed(pts_us));
-        }
-
-        // Same flush sequence as `seek_to_byte_position` and `seek`.
-        if let Some(ref mut decoder) = self.video_decoder {
-            decoder.flush();
-        }
-        if let Some(ref mut decoder) = self.audio_decoder {
-            decoder.flush();
-        }
-        self.audio_packet_queue.clear();
-        self.video_packet_queue.clear();
-        if let Some(ref mut resampler) = self.resampler {
-            let target_format = ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed);
-            let target_layout = ffmpeg::channel_layout::ChannelLayout::STEREO;
-            let mut flush_output = ffmpeg::frame::Audio::new(target_format, 4096, target_layout);
-            let _ = resampler.flush(&mut flush_output);
-        }
-
-        // Reset frame counters so the first frame after this seek has
-        // `frame_number == 0` (matches the behaviour of `seek`).
-        self.frame_number = 0;
-        self.audio_frame_number = 0;
-
-        // Arm the post-seek monotonicity check.
-        self.last_returned_pts_us = None;
-        self.monotonic_check_frames_remaining = 30;
-
-        log::info!("FFmpegContext::seek_to_keyframe_timestamp - complete");
-        Ok(())
-    }
-
     /// Seek to a specific time in microseconds (seeks to nearest keyframe)
     pub fn seek(&mut self, time_us: i64) -> Result<()> {
         log::info!(
@@ -1388,88 +1043,36 @@ impl FFmpegContext {
     }
 
     /// Seek precisely to a specific time in microseconds.
-    /// This performs a keyframe seek first, then decodes frames until reaching the target time.
-    /// Returns the frame at or just before the target time (frame-accurate seek).
+    /// This performs a container-aware timestamp seek to the nearest
+    /// keyframe at or before the target, then decodes forward until
+    /// landing on the frame at (or just before) the target time.
     ///
-    /// If a keyframe index is available, uses it for faster seeking by directly
-    /// jumping to the byte position of the nearest keyframe.
+    /// Routes through `avformat_seek_file` with `flags=0`, which calls
+    /// the demuxer's `read_seek` callback. For MXF that callback uses
+    /// the file's pre-parsed Index Table Segments (read by
+    /// `mxf_read_header` at open time) to land on the right edit unit
+    /// without scanning packets. The container-aware path is also what
+    /// re-emits SPS/PPS for H.264, restoring `num_reorder_frames` so
+    /// VideoToolbox emits frames in display (monotonic-PTS) order.
     pub fn seek_precise(&mut self, time_us: i64) -> Result<Option<VideoFrame>> {
         log::info!(
-            "FFmpegContext::seek_precise - time_us={}, time_base={}/{}, has_index={}",
+            "FFmpegContext::seek_precise - time_us={}, time_base={}/{}",
             time_us,
             self.video_time_base.numerator(),
             self.video_time_base.denominator(),
-            self.keyframe_index.is_some()
         );
 
-        // Use keyframe index for faster seeking if available.
-        //
-        // We use `seek_to_keyframe_timestamp` (not `seek_to_byte_position`)
-        // because byte-position seek (`AVSEEK_FLAG_BYTE`) bypasses the
-        // demuxer's `read_seek2` callback. For MXF, that callback handles
-        // edit-unit alignment and SPS/PPS in-band re-emission — without it,
-        // the H.264 + VideoToolbox decoder receives non-IDR slices with no
-        // fresh SPS, `num_reorder_frames` is never inferred, and frames
-        // come out in decode order (non-monotonic PTS) after seek.
-        //
-        // Timestamp seek avoids that: `avformat_seek_file` with `flags=0`
-        // routes through `read_seek2` which lands the demuxer on the
-        // edit-unit boundary at or before the requested PTS. The keyframe
-        // index still saves work — we already know the exact keyframe
-        // timestamp, so the demuxer doesn't have to scan to find one.
-        //
-        // `expected_kf_pts` is retained as an assertion: if the first
-        // decoded frame is far past the keyframe we asked for, the seek
-        // misbehaved (should not happen with timestamp seek, but if it
-        // does we want to know and fall back).
-        let mut expected_kf_pts: Option<i64> = None;
-        if let Some(ref index) = self.keyframe_index {
-            if let Some((kf_pts, kf_pos)) = index.find_keyframe_before(time_us) {
-                log::info!(
-                    "FFmpegContext::seek_precise - using keyframe index: pts={} us (kf_pos={} bytes, ignored — using timestamp seek)",
-                    kf_pts,
-                    kf_pos
-                );
-
-                match self.seek_to_keyframe_timestamp(kf_pts) {
-                    Ok(()) => {
-                        expected_kf_pts = Some(kf_pts);
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "FFmpegContext::seek_precise - timestamp seek to kf_pts={} failed: {:?}, falling back to seek(time_us)",
-                            kf_pts,
-                            e
-                        );
-                        self.seek(time_us)?;
-                    }
-                }
-            } else {
-                // No keyframe found, fall back to regular seek
-                self.seek(time_us)?;
-            }
-        } else {
-            // No index available, use regular seek
-            self.seek(time_us)?;
-        }
+        // Container-aware timestamp seek. FFmpeg's internal index (built
+        // from MXF Index Table Segments / mp4 stss / mov moov / mkv cues
+        // during `find_stream_info`) handles the keyframe lookup. We used
+        // to maintain a separate keyframe index here built by walking
+        // every packet — turned out to be redundant work and was removed.
+        self.seek(time_us)?;
 
         // Now decode frames until we reach the target time.
-        // We need to find the frame at or just before time_us.
-        //
-        // Assertion (kept from the byte-seek era): with timestamp seek the
-        // first decoded frame should land at (or very close to)
-        // `expected_kf_pts`. If it is further than `SYNC_LOSS_THRESHOLD_US`
-        // past, something has gone wrong upstream — log at error level and
-        // retry once via plain `seek()`. We don't expect this branch to fire
-        // in normal operation.
         let mut best_frame: Option<VideoFrame> = None;
         let max_frames = 300; // Limit to prevent infinite loop (enough for ~10 seconds at 30fps)
         let mut frame_count = 0;
-        let mut tried_timestamp_fallback = false;
-        // ~6 frames at 24fps. Generous window because the post-seek first
-        // frame can be a few frames past the keyframe due to startup delay
-        // in the H.264 + VT decoder; anything past this is a bug.
-        const SYNC_LOSS_THRESHOLD_US: i64 = 250_000;
 
         log::info!("FFmpegContext::seek_precise - decoding frames to reach target");
 
@@ -1493,33 +1096,6 @@ impl FFmpegContext {
                         frame_pts,
                         time_us
                     );
-
-                    // First-frame assertion: with timestamp seek (the primary
-                    // path now), the first decoded frame should be at or near
-                    // `expected_kf_pts`. If we ever see a large gap, the
-                    // container-aware seek failed in some surprising way —
-                    // log loudly and retry with plain `seek(time_us)`.
-                    if let Some(kf_pts) = expected_kf_pts {
-                        if !tried_timestamp_fallback
-                            && frame_count == 1
-                            && frame_pts > kf_pts + SYNC_LOSS_THRESHOLD_US
-                        {
-                            log::error!(
-                                "FFmpegContext::seek_precise - ASSERTION: first frame at {} us is {} ms past expected keyframe at {} us \
-                                 (target {} us). Timestamp seek did not land on the expected edit unit — bug?",
-                                frame_pts,
-                                (frame_pts - kf_pts) / 1_000,
-                                kf_pts,
-                                time_us
-                            );
-                            self.seek(time_us)?;
-                            tried_timestamp_fallback = true;
-                            expected_kf_pts = None;
-                            best_frame = None;
-                            frame_count = 0;
-                            continue;
-                        }
-                    }
 
                     // Check if this frame is at or before the target
                     if frame_pts <= time_us {
@@ -2441,103 +2017,6 @@ impl FFmpegContext {
         }
     }
 
-    /// Build a keyframe index by scanning all packets in the file.
-    ///
-    /// This is called during prepare() to enable fast seeking.
-    /// The index contains (pts_us, byte_position) pairs for all keyframes.
-    ///
-    /// # Arguments
-    /// * `max_keyframes` - Maximum number of keyframes to index (to limit memory usage)
-    ///
-    /// # Returns
-    /// The number of keyframes indexed
-    pub fn build_keyframe_index(&mut self, max_keyframes: usize) -> Result<usize> {
-        let video_stream_index = match self.video_stream_index {
-            Some(idx) => idx,
-            None => {
-                log::debug!("No video stream, skipping keyframe index");
-                return Ok(0);
-            }
-        };
-
-        log::info!("Building keyframe index (max: {} entries)...", max_keyframes);
-        let start_time = std::time::Instant::now();
-
-        let mut index = KeyframeIndex::new();
-        let time_base = self.video_time_base;
-
-        // Read all packets and collect keyframe positions
-        loop {
-            match self.input.packets().next() {
-                Some((stream, packet)) => {
-                    // Only process video stream packets
-                    if stream.index() != video_stream_index {
-                        continue;
-                    }
-
-                    // Check if this is a keyframe
-                    if packet.is_key() {
-                        if let Some(pts) = packet.pts() {
-                            let pts_us = Self::pts_to_us(pts, time_base);
-                            let position = packet.position();
-
-                            // Only add if position is valid (>= 0)
-                            if position >= 0 {
-                                index.add(pts_us, position as i64);
-
-                                if index.len() >= max_keyframes {
-                                    log::warn!(
-                                        "Keyframe index limit reached: {} entries",
-                                        max_keyframes
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                None => break,
-            }
-        }
-
-        // Sort the index by PTS (should already be sorted, but ensure it)
-        index.sort();
-
-        let count = index.len();
-        let elapsed = start_time.elapsed();
-
-        log::info!(
-            "Keyframe index built: {} entries in {:?} ({:.1} entries/sec)",
-            count,
-            elapsed,
-            count as f64 / elapsed.as_secs_f64().max(0.001)
-        );
-
-        // Store the index
-        self.keyframe_index = Some(index);
-
-        // Seek back to the beginning of the file
-        self.seek(0)?;
-
-        Ok(count)
-    }
-
-    /// Get a reference to the keyframe index
-    pub fn keyframe_index(&self) -> Option<&KeyframeIndex> {
-        self.keyframe_index.as_ref()
-    }
-
-    /// Check if keyframe index is available
-    pub fn has_keyframe_index(&self) -> bool {
-        self.keyframe_index.is_some()
-    }
-
-    /// Inject a pre-loaded keyframe index (e.g. from disk cache) instead
-    /// of building one by walking the stream. Used by `Decoder::prepare`
-    /// when `keyframe_index_cache_path` resolves to a valid cache hit.
-    pub fn set_keyframe_index(&mut self, index: KeyframeIndex) {
-        self.keyframe_index = Some(index);
-    }
 }
 
 /// Try to build a [`Timecode`] from the per-stream and format-level "timecode"
@@ -2609,87 +2088,6 @@ mod tests {
         // Round trip
         let pts = FFmpegContext::us_to_pts(us, time_base);
         assert_eq!(pts, 90000);
-    }
-
-    // -- KeyframeIndex disk cache --------------------------------------------
-
-    fn temp_cache_path(name: &str) -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!("cyb-ffmpeg-kfix-test-{}-{}.bin",
-            name,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()));
-        p
-    }
-
-    #[test]
-    fn keyframe_index_save_load_roundtrip() {
-        let mut idx = KeyframeIndex::new();
-        idx.add(0, 0);
-        idx.add(1_000_000, 4096);
-        idx.add(5_000_000, 16384);
-        idx.sort();
-
-        let path = temp_cache_path("roundtrip");
-        idx.save_to_disk(&path, 12345, 1_700_000_000).expect("save");
-
-        let loaded = KeyframeIndex::load_from_disk(&path, 12345, 1_700_000_000)
-            .expect("io ok")
-            .expect("entry exists");
-        assert_eq!(loaded.len(), 3);
-        assert_eq!(loaded.find_keyframe_before(2_000_000), Some((1_000_000, 4096)));
-
-        std::fs::remove_file(path).ok();
-    }
-
-    #[test]
-    fn keyframe_index_load_returns_none_when_size_changes() {
-        let mut idx = KeyframeIndex::new();
-        idx.add(0, 0);
-
-        let path = temp_cache_path("size-mismatch");
-        idx.save_to_disk(&path, 1000, 1_700_000_000).expect("save");
-
-        let loaded = KeyframeIndex::load_from_disk(&path, 9999, 1_700_000_000)
-            .expect("io ok");
-        assert!(loaded.is_none());
-
-        std::fs::remove_file(path).ok();
-    }
-
-    #[test]
-    fn keyframe_index_load_returns_none_when_mtime_changes() {
-        let mut idx = KeyframeIndex::new();
-        idx.add(0, 0);
-
-        let path = temp_cache_path("mtime-mismatch");
-        idx.save_to_disk(&path, 1000, 1_700_000_000).expect("save");
-
-        let loaded = KeyframeIndex::load_from_disk(&path, 1000, 1_700_000_001)
-            .expect("io ok");
-        assert!(loaded.is_none());
-
-        std::fs::remove_file(path).ok();
-    }
-
-    #[test]
-    fn keyframe_index_load_returns_none_when_file_missing() {
-        let path = temp_cache_path("does-not-exist");
-        let loaded = KeyframeIndex::load_from_disk(&path, 1000, 1_700_000_000)
-            .expect("io ok");
-        assert!(loaded.is_none());
-    }
-
-    #[test]
-    fn keyframe_index_load_returns_none_when_magic_wrong() {
-        let path = temp_cache_path("bad-magic");
-        std::fs::write(&path, b"NOPEbadbadbadbadbadbadbadbadbad").unwrap();
-        let loaded = KeyframeIndex::load_from_disk(&path, 1000, 1_700_000_000)
-            .expect("io ok");
-        assert!(loaded.is_none());
-        std::fs::remove_file(path).ok();
     }
 
     // -- extract_video_timecode -----------------------------------------------
