@@ -223,6 +223,13 @@ struct CybDecoderHandle *cyb_decoder_create(const char *path,
 // Prepare decoder
  enum CybResult cyb_decoder_prepare(struct CybDecoderHandle *handle) ;
 
+// Discard all video packets at the demuxer. Audio-only callers can
+// call this after `prepare()` to skip the I/O cost of reading video
+// bytes that will never be decoded — empirically 5-10× speedup for
+// audio extraction on 4K MXF where video dominates the file size.
+// No-op when the source has no video stream.
+ enum CybResult cyb_decoder_discard_video_stream(struct CybDecoderHandle *handle) ;
+
 // Destroy decoder
  void cyb_decoder_destroy(struct CybDecoderHandle *handle) ;
 

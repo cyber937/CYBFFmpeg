@@ -438,6 +438,24 @@ impl Decoder {
         false
     }
 
+    /// Tell the demuxer to discard all video packets. Useful for
+    /// audio-only callers (audio extraction, transcription preroll)
+    /// to avoid reading and parsing video bytes that will never be
+    /// decoded. See `FFmpegContext::discard_video_stream` for the
+    /// motivation.
+    ///
+    /// Must be called after `prepare()`.
+    pub fn discard_video_stream(&self) -> Result<()> {
+        if !self.is_prepared() {
+            return Err(Error::NotPrepared);
+        }
+        let mut ctx_lock = self.ffmpeg_ctx.lock();
+        if let Some(ref mut ctx) = *ctx_lock {
+            ctx.discard_video_stream();
+        }
+        Ok(())
+    }
+
     /// Get audio sample rate
     pub fn audio_sample_rate(&self) -> u32 {
         let ctx_lock = self.ffmpeg_ctx.lock();

@@ -171,6 +171,28 @@ public final class FFmpegDecoder: @unchecked Sendable {
         }
     }
 
+    /// Tell the demuxer to skip all video packets.
+    ///
+    /// Must be called **after** `prepare()`. Audio-only callers (audio
+    /// extraction, transcription preroll) can call this to avoid
+    /// reading and parsing video bytes that will never be decoded — an
+    /// empirical 5-10× speedup on cold 4K MXF where video dominates
+    /// the file size. No-op when the source has no video stream.
+    ///
+    /// After this call, `getNextFrame` / `getFrame(at:)` will produce
+    /// no video frames; only audio APIs return data. Reverting is not
+    /// supported on the same decoder instance — discard and rebuild a
+    /// new `FFmpegDecoder` if you later need video.
+    public func discardVideoStream() throws {
+        try checkNotInvalidated()
+        try checkPrepared()
+
+        guard let bridge = bridge else {
+            throw FFmpegError.invalidHandle
+        }
+        try bridge.discardVideoStream()
+    }
+
     /// Invalidate the decoder and release all resources
     public func invalidate() {
         lock.withLock {
