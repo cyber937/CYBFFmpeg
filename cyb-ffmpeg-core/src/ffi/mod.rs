@@ -222,6 +222,23 @@ pub extern "C" fn cyb_decoder_prepare(handle: *mut CybDecoderHandle) -> CybResul
     decoder.prepare().into()
 }
 
+/// Discard all video packets at the demuxer. Audio-only callers can
+/// call this after `prepare()` to skip the I/O cost of reading video
+/// bytes that will never be decoded — empirically 5-10× speedup for
+/// audio extraction on 4K MXF where video dominates the file size.
+/// No-op when the source has no video stream.
+#[no_mangle]
+pub extern "C" fn cyb_decoder_discard_video_stream(
+    handle: *mut CybDecoderHandle,
+) -> CybResult {
+    if handle.is_null() {
+        return CybResult::ErrorInvalidHandle;
+    }
+    let handle = unsafe { &*handle };
+    let decoder = handle.decoder.lock();
+    decoder.discard_video_stream().into()
+}
+
 /// Destroy decoder
 #[no_mangle]
 pub extern "C" fn cyb_decoder_destroy(handle: *mut CybDecoderHandle) {

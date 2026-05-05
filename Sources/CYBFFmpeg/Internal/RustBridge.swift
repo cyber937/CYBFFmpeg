@@ -72,6 +72,16 @@ internal final class RustBridge: @unchecked Sendable {
         }
     }
 
+    /// Discard all video packets at the demuxer. Must be called after
+    /// `prepare()`. See `FFmpegDecoder.discardVideoStream()` for the
+    /// motivation.
+    func discardVideoStream() throws {
+        try withHandle { handle in
+            let result = cyb_decoder_discard_video_stream(handle)
+            try Self.checkResult(result)
+        }
+    }
+
     /// Destroy the decoder
     func destroy() {
         lock.withLock {
