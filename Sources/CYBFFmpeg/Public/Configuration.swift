@@ -49,6 +49,21 @@ public struct DecoderConfiguration: Sendable {
     /// Default `nil` preserves current behavior (always rebuild).
     public let keyframeIndexCachePath: String?
 
+    /// Target audio channel count for the internal resampler.
+    ///
+    /// - `0` (`.preserveSourceLayout`) skips channel-layout
+    ///   conversion — useful for audio-extract callers where stereo
+    ///   upsampling is wasted work (halves PCM buffer size, FFI
+    ///   roundtrips, and `swr_convert` cost on mono sources).
+    /// - `1` forces mono.
+    /// - `2` (default) forces stereo, the historical playback
+    ///   contract.
+    public let targetAudioChannels: UInt32
+
+    /// Sentinel for `targetAudioChannels` that means "match the
+    /// source layout" (no upsampling / downsampling).
+    public static let preserveSourceAudioLayout: UInt32 = 0
+
     // MARK: Initialization
 
     /// Create a custom configuration
@@ -58,7 +73,8 @@ public struct DecoderConfiguration: Sendable {
         threadCount: Int = 0,
         outputPixelFormat: PixelFormat = .nv12,
         skipKeyframeIndexing: Bool = false,
-        keyframeIndexCachePath: String? = nil
+        keyframeIndexCachePath: String? = nil,
+        targetAudioChannels: UInt32 = 2
     ) {
         self.preferHardwareDecoding = preferHardwareDecoding
         self.cacheConfiguration = cacheConfiguration
@@ -66,6 +82,7 @@ public struct DecoderConfiguration: Sendable {
         self.outputPixelFormat = outputPixelFormat
         self.skipKeyframeIndexing = skipKeyframeIndexing
         self.keyframeIndexCachePath = keyframeIndexCachePath
+        self.targetAudioChannels = targetAudioChannels
     }
 
     // MARK: Presets

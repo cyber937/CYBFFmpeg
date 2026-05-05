@@ -529,7 +529,8 @@ extension DecoderConfiguration {
             thread_count: UInt32(threadCount),
             output_pixel_format: outputPixelFormat.toCybFormat(),
             skip_keyframe_indexing: skipKeyframeIndexing,
-            keyframe_index_cache_path: nil
+            keyframe_index_cache_path: nil,
+            target_audio_channels: targetAudioChannels
         )
     }
 }

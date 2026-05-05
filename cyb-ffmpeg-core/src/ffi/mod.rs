@@ -137,6 +137,10 @@ pub struct CybDecoderConfig {
     /// be valid for the duration of the `cyb_decoder_create` call —
     /// Rust copies the string into its own allocation.
     pub keyframe_index_cache_path: *const c_char,
+    /// Target audio channel count for resampling. `0` = preserve the
+    /// source layout (skip mono-to-stereo upsampling). `1` = mono,
+    /// `2` = stereo, etc. Default `2` for backwards compatibility.
+    pub target_audio_channels: u32,
 }
 
 impl From<&CybDecoderConfig> for DecoderConfig {
@@ -164,6 +168,7 @@ impl From<&CybDecoderConfig> for DecoderConfig {
             },
             skip_keyframe_indexing: c.skip_keyframe_indexing,
             keyframe_index_cache_path: cache_path,
+            target_audio_channels: c.target_audio_channels,
         }
     }
 }

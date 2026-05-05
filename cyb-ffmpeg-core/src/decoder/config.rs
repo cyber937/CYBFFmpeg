@@ -57,6 +57,17 @@ pub struct DecoderConfig {
     /// (see `skip_keyframe_indexing`), so there is nothing to cache.
     /// Retained as a struct field for ABI / API stability.
     pub keyframe_index_cache_path: Option<String>,
+
+    /// Target channel count for audio resampling. `0` means "match
+    /// the source" (no channel-layout conversion in the resampler —
+    /// useful for audio-extract flows that don't need stereo output).
+    /// Any non-zero value forces resampling to that many channels;
+    /// `2` (the historical default) maps to `ChannelLayout::STEREO`.
+    ///
+    /// Set to `0` from `FFmpegAudioDecoder` to skip mono-to-stereo
+    /// upsampling, which halves PCM buffer size, cuts FFI roundtrips
+    /// per frame, and avoids unnecessary swr_convert work.
+    pub target_audio_channels: u32,
 }
 
 impl Default for DecoderConfig {
@@ -71,6 +82,7 @@ impl Default for DecoderConfig {
             output_pixel_format: PixelFormat::Nv12,
             skip_keyframe_indexing: false,
             keyframe_index_cache_path: None,
+            target_audio_channels: 2,
         }
     }
 }
@@ -88,6 +100,7 @@ impl DecoderConfig {
             output_pixel_format: PixelFormat::Nv12,
             skip_keyframe_indexing: false,
             keyframe_index_cache_path: None,
+            target_audio_channels: 2,
         }
     }
 
@@ -103,6 +116,7 @@ impl DecoderConfig {
             output_pixel_format: PixelFormat::Nv12,
             skip_keyframe_indexing: false,
             keyframe_index_cache_path: None,
+            target_audio_channels: 2,
         }
     }
 
@@ -118,6 +132,7 @@ impl DecoderConfig {
             output_pixel_format: PixelFormat::Nv12,
             skip_keyframe_indexing: false,
             keyframe_index_cache_path: None,
+            target_audio_channels: 2,
         }
     }
 
@@ -140,6 +155,7 @@ impl DecoderConfig {
             output_pixel_format: PixelFormat::Nv12,
             skip_keyframe_indexing: true,
             keyframe_index_cache_path: None,
+            target_audio_channels: 0,
         }
     }
 }
