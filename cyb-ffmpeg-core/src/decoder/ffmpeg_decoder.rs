@@ -178,7 +178,11 @@ impl FFmpegContext {
             resampler: None,
             target_format: config.output_pixel_format,
             target_sample_rate: 48000, // Standard audio sample rate
-            target_channels: 2,        // Stereo
+            // `0` is a sentinel meaning "preserve source layout" —
+            // resolved during `init_audio_decoder` to the actual
+            // source channel count. Otherwise honor the explicit
+            // request from config (default `2` = stereo).
+            target_channels: config.target_audio_channels,
             frame_number: 0,
             audio_frame_number: 0,
             video_time_base: Rational::new(1, 1000000),
@@ -733,8 +737,32 @@ impl FFmpegContext {
             }
         };
 
-        // Target: stereo, float32, 48kHz
-        let target_layout = ffmpeg::channel_layout::ChannelLayout::STEREO;
+        // Target layout: by default stereo (the historical playback
+        // contract), but `config.target_audio_channels = 0` opts out
+        // of channel-layout conversion and preserves the source
+        // layout. Audio-extract callers (e.g. `FFmpegAudioDecoder`)
+        // use that to skip mono → stereo upsampling, halving PCM
+        // buffer size and FFI cost per frame.
+        let (target_layout, effective_target_channels) = if self.target_channels == 0 {
+            (source_layout, source_channels)
+        } else {
+            let layout = match self.target_channels {
+                1 => ffmpeg::channel_layout::ChannelLayout::MONO,
+                2 => ffmpeg::channel_layout::ChannelLayout::STEREO,
+                _ => {
+                    log::warn!(
+                        "Unsupported target_audio_channels: {}, defaulting to stereo",
+                        self.target_channels
+                    );
+                    ffmpeg::channel_layout::ChannelLayout::STEREO
+                }
+            };
+            (layout, self.target_channels)
+        };
+        // Sync the active channel count back so downstream readers
+        // (`audio_channels()`, frame metadata) report the right value
+        // when a caller opted into source-layout passthrough.
+        self.target_channels = effective_target_channels;
         let target_format = ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed);
 
         // Create resampler

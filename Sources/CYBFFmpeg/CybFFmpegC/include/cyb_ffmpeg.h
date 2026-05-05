@@ -75,6 +75,10 @@ typedef struct CybDecoderConfig {
     // be valid for the duration of the `cyb_decoder_create` call —
     // Rust copies the string into its own allocation.
     const char *keyframe_index_cache_path;
+    // Target audio channel count for resampling. `0` = preserve the
+    // source layout (skip mono-to-stereo upsampling). `1` = mono,
+    // `2` = stereo, etc. Default `2` for backwards compatibility.
+    uint32_t target_audio_channels;
 } CybDecoderConfig;
 
 typedef struct CybCacheStats {
