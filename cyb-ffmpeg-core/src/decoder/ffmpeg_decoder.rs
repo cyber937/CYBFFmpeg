@@ -1047,9 +1047,16 @@ impl FFmpegContext {
         // This is critical for MPEG audio (MP2/MP3) which uses overlapping synthesis windows.
         if let Some(ref mut resampler) = self.resampler {
             log::info!("FFmpegContext::seek - flushing audio resampler");
-            // Create a temporary output frame to receive any remaining samples (discard them)
+            // Create a temporary output frame to receive any remaining samples (discard them).
+            // Layout must match the resampler's actual output layout — hard-coding
+            // STEREO here breaks `swr_convert` for callers that opted into mono
+            // passthrough (`target_audio_channels = 1`).
             let target_format = ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed);
-            let target_layout = ffmpeg::channel_layout::ChannelLayout::STEREO;
+            let target_layout = match self.target_channels {
+                1 => ffmpeg::channel_layout::ChannelLayout::MONO,
+                2 => ffmpeg::channel_layout::ChannelLayout::STEREO,
+                _ => ffmpeg::channel_layout::ChannelLayout::STEREO,
+            };
             let mut flush_output = ffmpeg::frame::Audio::new(target_format, 4096, target_layout);
             // Flush may fail if no samples buffered, ignore the error
             let _ = resampler.flush(&mut flush_output);
@@ -1233,11 +1240,17 @@ impl FFmpegContext {
             decoder.flush();
         }
 
-        // Flush resampler to clear any buffered samples
+        // Flush resampler to clear any buffered samples. Layout must
+        // match what the resampler was initialized with (see comment
+        // in `seek` for the same fix).
         if let Some(ref mut resampler) = self.resampler {
             log::info!("prime_audio_after_seek - flushing audio resampler");
             let target_format = ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed);
-            let target_layout = ffmpeg::channel_layout::ChannelLayout::STEREO;
+            let target_layout = match self.target_channels {
+                1 => ffmpeg::channel_layout::ChannelLayout::MONO,
+                2 => ffmpeg::channel_layout::ChannelLayout::STEREO,
+                _ => ffmpeg::channel_layout::ChannelLayout::STEREO,
+            };
             let mut flush_output = ffmpeg::frame::Audio::new(target_format, 4096, target_layout);
             let _ = resampler.flush(&mut flush_output);
         }
@@ -1905,7 +1918,17 @@ impl FFmpegContext {
         };
 
         let target_format = ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed);
-        let target_layout = ffmpeg::channel_layout::ChannelLayout::STEREO;
+        // Match the layout the resampler was initialized with. We
+        // used to hard-code STEREO here, which broke whenever
+        // `target_audio_channels` was set to a non-stereo value
+        // (e.g. mono passthrough for FFmpegAudioDecoder) — `swr_convert`
+        // then failed with "Output changed" because the resampler's
+        // output format and the output buffer's layout disagreed.
+        let target_layout = match self.target_channels {
+            1 => ffmpeg::channel_layout::ChannelLayout::MONO,
+            2 => ffmpeg::channel_layout::ChannelLayout::STEREO,
+            _ => ffmpeg::channel_layout::ChannelLayout::STEREO,
+        };
 
         // Create and allocate output frame
         let mut resampled = ffmpeg::frame::Audio::new(target_format, expected_output_samples, target_layout);
