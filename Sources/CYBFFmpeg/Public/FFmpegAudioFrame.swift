@@ -148,3 +148,50 @@ extension FFmpegAudioFrame: Hashable {
         hasher.combine(presentationTime)
     }
 }
+
+// MARK: - FFmpegAudioFrameSummary
+
+/// Compact, no-samples-attached summary of a decoded audio frame. Use
+/// `FFmpegDecoder.getNextAudioFrameSummary()` for callers (e.g. waveform
+/// generators) that only need first-channel min/max plus timing — the
+/// underlying `Vec<f32>` is dropped on the Rust side, which avoids the
+/// per-frame `Array(UnsafeBufferPointer)` copy that pushed peak heap
+/// usage above 100 MB on long multi-channel MXF sources.
+public struct FFmpegAudioFrameSummary: Sendable, Hashable {
+    /// Min sample on the first channel.
+    public let min: Float
+    /// Max sample on the first channel.
+    public let max: Float
+    /// Number of samples per channel.
+    public let sampleCount: Int
+    /// Number of audio channels.
+    public let channels: Int
+    /// Sample rate in Hz.
+    public let sampleRate: Int
+    /// Presentation timestamp in seconds.
+    public let presentationTime: Double
+    /// Duration in seconds.
+    public let duration: Double
+    /// Sequential frame number.
+    public let frameNumber: Int64
+
+    public init(
+        min: Float,
+        max: Float,
+        sampleCount: Int,
+        channels: Int,
+        sampleRate: Int,
+        presentationTime: Double,
+        duration: Double,
+        frameNumber: Int64
+    ) {
+        self.min = min
+        self.max = max
+        self.sampleCount = sampleCount
+        self.channels = channels
+        self.sampleRate = sampleRate
+        self.presentationTime = presentationTime
+        self.duration = duration
+        self.frameNumber = frameNumber
+    }
+}

@@ -287,6 +287,35 @@ internal final class RustBridge: @unchecked Sendable {
         return Self.convertAudioFrame(frameHandle)
     }
 
+    /// Pulls the next audio frame summary (Rust computes first-channel
+    /// min/max in place and drops the frame). Returns nil at end-of-stream
+    /// or on error.
+    func getNextAudioFrameSummary() -> FFmpegAudioFrameSummary? {
+        guard let handle = handle else { return nil }
+
+        var summary = CybAudioFrameSummary(
+            min: 0, max: 0,
+            sample_count: 0, channels: 0, sample_rate: 0,
+            pts_us: 0, duration_us: 0, frame_number: 0,
+            has_frame: false
+        )
+        let result = cyb_decoder_get_next_audio_frame_summary(handle, &summary)
+        guard result == CYB_RESULT_SUCCESS, summary.has_frame else {
+            return nil
+        }
+
+        return FFmpegAudioFrameSummary(
+            min: summary.min,
+            max: summary.max,
+            sampleCount: Int(summary.sample_count),
+            channels: Int(summary.channels),
+            sampleRate: Int(summary.sample_rate),
+            presentationTime: Double(summary.pts_us) / 1_000_000.0,
+            duration: Double(summary.duration_us) / 1_000_000.0,
+            frameNumber: summary.frame_number
+        )
+    }
+
     /// Prime audio decoder after seek.
     /// Call this after seek() and before getNextAudioFrame() to ensure
     /// audio packets are pre-loaded into the queue for immediate decoding.

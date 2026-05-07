@@ -1100,6 +1100,123 @@ pub extern "C" fn cyb_audio_frame_release(frame_handle: *mut CybAudioFrameHandle
     }
 }
 
+/// Per-frame summary for callers (e.g. waveform generators) that don't
+/// need raw samples in Swift. Rust computes min/max over the first
+/// channel of the frame's interleaved data and drops the frame before
+/// returning, so the Swift side never sees the underlying `Vec<f32>` —
+/// avoiding the per-frame `Array(UnsafeBufferPointer)` copy that pushed
+/// peak heap usage above 100 MB on long multi-channel MXF sources.
+///
+/// `has_frame == false` indicates end-of-stream; the rest of the fields
+/// are zeroed in that case.
+#[repr(C)]
+pub struct CybAudioFrameSummary {
+    /// Min sample (first channel only) — `0.0` when `has_frame == false`.
+    pub min: f32,
+    /// Max sample (first channel only) — `0.0` when `has_frame == false`.
+    pub max: f32,
+    /// Number of samples per channel.
+    pub sample_count: u32,
+    /// Number of audio channels.
+    pub channels: u32,
+    /// Sample rate in Hz.
+    pub sample_rate: u32,
+    /// Presentation timestamp in microseconds.
+    pub pts_us: i64,
+    /// Duration in microseconds.
+    pub duration_us: i64,
+    /// Sequential frame number.
+    pub frame_number: i64,
+    /// `true` when a frame was decoded; `false` at end-of-stream.
+    pub has_frame: bool,
+}
+
+/// Pulls the next audio frame and returns its first-channel min/max plus
+/// metadata, dropping the frame before returning so its sample buffer
+/// never crosses the FFI boundary. Designed for waveform generation: the
+/// Swift caller aggregates these per-frame summaries into per-window
+/// stats. End-of-stream is signaled by `out_summary.has_frame == false`
+/// (with `CybResult::Success`).
+#[no_mangle]
+pub extern "C" fn cyb_decoder_get_next_audio_frame_summary(
+    handle: *mut CybDecoderHandle,
+    out_summary: *mut CybAudioFrameSummary,
+) -> CybResult {
+    if handle.is_null() || out_summary.is_null() {
+        return CybResult::ErrorInvalidHandle;
+    }
+
+    let zero_summary = || unsafe {
+        (*out_summary).min = 0.0;
+        (*out_summary).max = 0.0;
+        (*out_summary).sample_count = 0;
+        (*out_summary).channels = 0;
+        (*out_summary).sample_rate = 0;
+        (*out_summary).pts_us = 0;
+        (*out_summary).duration_us = 0;
+        (*out_summary).frame_number = 0;
+        (*out_summary).has_frame = false;
+    };
+
+    let handle_ref = unsafe { &*handle };
+    let mut decoder = handle_ref.decoder.lock();
+
+    match decoder.get_next_audio_frame() {
+        Ok(Some(frame)) => {
+            let channels = frame.channels.max(1) as usize;
+            let total_samples = (frame.sample_count as usize) * channels;
+            let mut min_val = f32::INFINITY;
+            let mut max_val = f32::NEG_INFINITY;
+
+            // First-channel-only stride — matches the existing Swift
+            // waveform path, which also discards channels 1..N for
+            // visualization. The audio data is interleaved, so channel
+            // zero is at indices 0, channels, 2*channels, … .
+            let data = &frame.data;
+            if total_samples > 0 && data.len() >= total_samples {
+                for i in (0..total_samples).step_by(channels) {
+                    let s = data[i];
+                    if s < min_val {
+                        min_val = s;
+                    }
+                    if s > max_val {
+                        max_val = s;
+                    }
+                }
+            }
+
+            if !min_val.is_finite() {
+                min_val = 0.0;
+            }
+            if !max_val.is_finite() {
+                max_val = 0.0;
+            }
+
+            unsafe {
+                (*out_summary).min = min_val;
+                (*out_summary).max = max_val;
+                (*out_summary).sample_count = frame.sample_count;
+                (*out_summary).channels = frame.channels;
+                (*out_summary).sample_rate = frame.sample_rate;
+                (*out_summary).pts_us = frame.pts_us;
+                (*out_summary).duration_us = frame.duration_us;
+                (*out_summary).frame_number = frame.frame_number;
+                (*out_summary).has_frame = true;
+            }
+            // `frame` is dropped here, freeing its backing `Vec<f32>`.
+            CybResult::Success
+        }
+        Ok(None) => {
+            zero_summary();
+            CybResult::Success
+        }
+        Err(e) => {
+            zero_summary();
+            e.into()
+        }
+    }
+}
+
 /// Check if decoder has audio
 #[no_mangle]
 pub extern "C" fn cyb_decoder_has_audio(handle: *const CybDecoderHandle) -> bool {
