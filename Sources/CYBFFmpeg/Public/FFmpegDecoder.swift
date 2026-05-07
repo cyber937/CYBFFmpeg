@@ -355,6 +355,20 @@ public final class FFmpegDecoder: @unchecked Sendable {
         return bridge.getNextAudioFrame()
     }
 
+    /// Pulls the next audio frame's first-channel min/max plus timing
+    /// metadata, without crossing the FFI boundary with the raw sample
+    /// buffer. Use this for waveform generation and similar consumers
+    /// that don't need samples in Swift — the underlying `Vec<f32>` is
+    /// dropped on the Rust side, eliminating the per-frame
+    /// `Array(UnsafeBufferPointer)` copy.
+    /// - Returns: A summary, or `nil` at end-of-stream / on error.
+    public func getNextAudioFrameSummary() -> FFmpegAudioFrameSummary? {
+        guard !isInvalidated, isPrepared, let bridge = bridge else {
+            return nil
+        }
+        return bridge.getNextAudioFrameSummary()
+    }
+
     // MARK: - Private Helpers
 
     private func checkNotInvalidated() throws {

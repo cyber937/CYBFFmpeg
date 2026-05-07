@@ -204,6 +204,36 @@ typedef struct CybAudioFrame {
     int64_t frame_number;
 } CybAudioFrame;
 
+// Per-frame summary for callers (e.g. waveform generators) that don't
+// need raw samples in Swift. Rust computes min/max over the first
+// channel of the frame's interleaved data and drops the frame before
+// returning, so the Swift side never sees the underlying `Vec<f32>` —
+// avoiding the per-frame `Array(UnsafeBufferPointer)` copy that pushed
+// peak heap usage above 100 MB on long multi-channel MXF sources.
+//
+// `has_frame == false` indicates end-of-stream; the rest of the fields
+// are zeroed in that case.
+typedef struct CybAudioFrameSummary {
+    // Min sample (first channel only) — `0.0` when `has_frame == false`.
+    float min;
+    // Max sample (first channel only) — `0.0` when `has_frame == false`.
+    float max;
+    // Number of samples per channel.
+    uint32_t sample_count;
+    // Number of audio channels.
+    uint32_t channels;
+    // Sample rate in Hz.
+    uint32_t sample_rate;
+    // Presentation timestamp in microseconds.
+    int64_t pts_us;
+    // Duration in microseconds.
+    int64_t duration_us;
+    // Sequential frame number.
+    int64_t frame_number;
+    // `true` when a frame was decoded; `false` at end-of-stream.
+    bool has_frame;
+} CybAudioFrameSummary;
+
 extern const void *CFRetain(const void *cf);
 
 extern void CFRelease(const void *cf);
@@ -371,6 +401,17 @@ void cyb_audio_frame_get_data(const struct CybAudioFrameHandle *frame_handle,
 
 // Release audio frame handle
  void cyb_audio_frame_release(struct CybAudioFrameHandle *frame_handle) ;
+
+// Pulls the next audio frame and returns its first-channel min/max plus
+// metadata, dropping the frame before returning so its sample buffer
+// never crosses the FFI boundary. Designed for waveform generation: the
+// Swift caller aggregates these per-frame summaries into per-window
+// stats. End-of-stream is signaled by `out_summary.has_frame == false`
+// (with `CybResult::Success`).
+
+enum CybResult cyb_decoder_get_next_audio_frame_summary(struct CybDecoderHandle *handle,
+                                                        struct CybAudioFrameSummary *out_summary)
+;
 
 // Check if decoder has audio
  bool cyb_decoder_has_audio(const struct CybDecoderHandle *handle) ;
