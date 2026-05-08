@@ -92,6 +92,29 @@ pub struct FFmpegContext {
     /// Time base for audio stream
     audio_time_base: Rational,
 
+    /// Video stream `start_time` in microseconds. Subtracted from raw
+    /// frame PTS so the decoder reports 0-based timestamps regardless
+    /// of the container's recording timecode offset (e.g. broadcast
+    /// MXF where the first frame's stream PTS can be ~104s). 0 when
+    /// the container reports no start_time. Added back when seeking
+    /// (FFmpeg's `av_seek_frame` expects absolute stream PTS).
+    video_start_time_us: i64,
+
+    /// Audio stream `start_time` in microseconds. Same role as
+    /// `video_start_time_us` for the audio stream; usually equal to
+    /// the video offset on professional captures but may diverge on
+    /// stream-mux'd containers, so tracked independently.
+    audio_start_time_us: i64,
+
+    /// True after `discard_video_stream()` is called. The audio
+    /// decoder's `video_packet_queue` is private to its context (the
+    /// video decoder runs in a separate `FFmpegContext`), so queuing
+    /// video packets here is pure waste — they're never consumed and
+    /// the queue grows unboundedly (each 4K DNxHR packet is multiple
+    /// MB, drowning audio decode in ~500 ms / frame). When this flag
+    /// is set, video packets are dropped instead of queued.
+    video_discarded: bool,
+
     /// Video duration in microseconds
     duration_us: i64,
 
@@ -187,6 +210,9 @@ impl FFmpegContext {
             audio_frame_number: 0,
             video_time_base: Rational::new(1, 1000000),
             audio_time_base: Rational::new(1, 1000000),
+            video_start_time_us: 0,
+            audio_start_time_us: 0,
+            video_discarded: false,
             duration_us: 0,
             frame_rate: 0.0,
             width: 0,
@@ -223,6 +249,21 @@ impl FFmpegContext {
         // Get codec parameters
         let codec_params = stream.parameters();
         self.video_time_base = stream.time_base();
+
+        // Capture stream start_time so frame PTS can be reported as
+        // 0-based downstream. AV_NOPTS_VALUE (i64::MIN) means the
+        // container didn't record one — treat as 0 (no offset).
+        let raw_video_start = stream.start_time();
+        self.video_start_time_us = if raw_video_start == ffmpeg::ffi::AV_NOPTS_VALUE {
+            0
+        } else {
+            Self::pts_to_us(raw_video_start, self.video_time_base).max(0)
+        };
+        log::info!(
+            "Video stream start_time: raw={}, us={}",
+            raw_video_start,
+            self.video_start_time_us
+        );
 
         // Calculate duration
         // For elementary streams like .m2v, neither stream nor container duration
@@ -682,6 +723,20 @@ impl FFmpegContext {
         let codec_params = stream.parameters();
         self.audio_time_base = stream.time_base();
 
+        // Capture audio stream start_time. See `video_start_time_us` for
+        // why this is needed; AV_NOPTS_VALUE → 0 offset.
+        let raw_audio_start = stream.start_time();
+        self.audio_start_time_us = if raw_audio_start == ffmpeg::ffi::AV_NOPTS_VALUE {
+            0
+        } else {
+            Self::pts_to_us(raw_audio_start, self.audio_time_base).max(0)
+        };
+        log::info!(
+            "Audio stream start_time: raw={}, us={}",
+            raw_audio_start,
+            self.audio_start_time_us
+        );
+
         // Find decoder
         let decoder_codec = ffmpeg::decoder::find(codec_params.id()).ok_or_else(|| {
             Error::CodecNotSupported(format!("No decoder for audio codec: {:?}", codec_params.id()))
@@ -940,22 +995,36 @@ impl FFmpegContext {
         })
     }
 
-    /// Seek to a specific time in microseconds (seeks to nearest keyframe)
+    /// Seek to a specific time in microseconds (seeks to nearest keyframe).
+    ///
+    /// `time_us` is **0-based** (relative to the file's first frame),
+    /// matching the timestamp space the rest of the API exposes via
+    /// frame `pts_us`. Internally translated back to the container's
+    /// absolute stream PTS for `av_seek_frame`, which expects values
+    /// in the original stream timeline.
     pub fn seek(&mut self, time_us: i64) -> Result<()> {
+        // Translate caller's 0-based time into the container's absolute
+        // stream PTS. For containers with no recorded `start_time` this
+        // is a no-op; for broadcast MXF (etc.) it adds back the offset
+        // we strip in `create_video_frame_with_pts` / `receive_audio_frame`.
+        let absolute_time_us = time_us.saturating_add(self.video_start_time_us);
+
         log::info!(
-            "FFmpegContext::seek - time_us={}, time_base={}/{}",
+            "FFmpegContext::seek - time_us={} (absolute={}), time_base={}/{}, video_start_time_us={}",
             time_us,
+            absolute_time_us,
             self.video_time_base.numerator(),
-            self.video_time_base.denominator()
+            self.video_time_base.denominator(),
+            self.video_start_time_us
         );
 
         // The seek function uses stream index -1 which means AV_TIME_BASE (microseconds)
         // Per ffmpeg-next docs: seek(timestamp, range) where range is ..timestamp
         // to seek to a keyframe at or before the target position
-        log::info!("FFmpegContext::seek - calling input.seek() with target={} us", time_us);
+        log::info!("FFmpegContext::seek - calling input.seek() with target={} us", absolute_time_us);
 
         // Try timestamp-based seek first
-        let seek_result = self.input.seek(time_us, ..time_us);
+        let seek_result = self.input.seek(absolute_time_us, ..absolute_time_us);
 
         if let Err(e) = seek_result {
             log::warn!("FFmpegContext::seek - timestamp seek failed: {}, trying byte-based seek", e);
@@ -1515,8 +1584,15 @@ impl FFmpegContext {
         let width = frame.width();
         let height = frame.height();
 
-        // Calculate PTS in microseconds
-        let pts_us = Self::pts_to_us(pts, self.video_time_base);
+        // Calculate PTS in microseconds, normalised to a 0-based
+        // timeline by subtracting the stream's `start_time`. Containers
+        // with broadcast timecode (MXF, MOV with TC track) record the
+        // first sample at a non-zero PTS; downstream consumers
+        // (AVSampleBufferRenderSynchronizer, UI scrubber) expect 0 to
+        // mean the file's first frame, matching AVFoundation's
+        // implicit normalisation in `AVAssetReader`.
+        let pts_us =
+            (Self::pts_to_us(pts, self.video_time_base) - self.video_start_time_us).max(0);
 
         // Calculate frame duration
         let frame_duration_us = if self.frame_rate > 0.0 {
@@ -1745,6 +1821,7 @@ impl FFmpegContext {
         unsafe {
             (*stream.as_mut_ptr()).discard = ffmpeg::ffi::AVDiscard::AVDISCARD_ALL;
         }
+        self.video_discarded = true;
         log::info!(
             "FFmpegContext: discarding video stream {} (audio-only mode)",
             video_idx
@@ -1793,7 +1870,16 @@ impl FFmpegContext {
                         if stream.index() == audio_stream_idx {
                             Some(packet)
                         } else if Some(stream.index()) == self.video_stream_index {
-                            // Queue video packets for later decoding
+                            // When `discard_video_stream` has been called the
+                            // audio decoder is run audio-only — its dedicated
+                            // `video_packet_queue` is never read by anyone, so
+                            // queuing here is pure waste (each 4K DNxHR packet
+                            // is multiple MB and the queue grows unboundedly,
+                            // pushing per-frame `nextAudioFrame` from a few ms
+                            // up to ~500 ms). Drop the packet instead.
+                            if self.video_discarded {
+                                continue;
+                            }
                             log::trace!("decode_next_audio_frame - queueing video packet (stream {})", stream.index());
                             self.video_packet_queue.push_back(packet);
                             continue;
@@ -1853,9 +1939,11 @@ impl FFmpegContext {
 
         match decoder.receive_frame(&mut decoded) {
             Ok(()) => {
-                // Get timestamp
+                // Get timestamp, normalised to a 0-based timeline (see
+                // `create_video_frame_with_pts` for rationale).
                 let pts = decoded.pts().unwrap_or(0);
-                let pts_us = Self::pts_to_us(pts, self.audio_time_base);
+                let pts_us =
+                    (Self::pts_to_us(pts, self.audio_time_base) - self.audio_start_time_us).max(0);
 
                 log::debug!(
                     "receive_audio_frame - decoded: pts={}, samples={}, rate={}, channels={}, format={:?}",
@@ -2067,14 +2155,22 @@ impl FFmpegContext {
         output
     }
 
-    /// Seek audio stream
+    /// Seek audio stream. `time_us` is 0-based (relative to the file's
+    /// first frame); translated back to the container's absolute stream
+    /// PTS for `av_seek_frame`. See `seek` for the rationale.
     pub fn seek_audio(&mut self, time_us: i64) -> Result<()> {
-        log::debug!("seek_audio - seeking to {} us", time_us);
+        let absolute_time_us = time_us.saturating_add(self.audio_start_time_us);
+        log::debug!(
+            "seek_audio - seeking to {} us (absolute={}, audio_start_time_us={})",
+            time_us,
+            absolute_time_us,
+            self.audio_start_time_us
+        );
 
         // Seek using container-level seek (affects all streams)
         self.input
-            .seek(time_us, ..time_us)
-            .map_err(|e| Error::SeekFailed(time_us))?;
+            .seek(absolute_time_us, ..absolute_time_us)
+            .map_err(|_e| Error::SeekFailed(time_us))?;
 
         // Flush audio decoder
         if let Some(ref mut decoder) = self.audio_decoder {
