@@ -1030,8 +1030,22 @@ impl FFmpegContext {
             log::warn!("FFmpegContext::seek - timestamp seek failed: {}, trying byte-based seek", e);
 
             // For elementary streams (like .m2v), timestamp seek may fail
-            // Fall back to byte-based seek
-            if time_us == 0 {
+            // Fall back to byte-based seek.
+            //
+            // The `<= 0` arm also catches *negative* biased seeks issued
+            // by audio decoders that pre-bias targets to land before
+            // misaligned audio chunks (CYBFFmpegDecoder does this for MXF
+            // where the demuxer otherwise lands ~4 s past the requested
+            // audio time). Negative `time_us` would otherwise hit the
+            // proportional fallback below and produce a negative
+            // `byte_pos`, which `av_seek_frame` rejects — leaving the
+            // demuxer where it was (= silence after every scrub-to-start
+            // for files where video has a broadcast TC offset but audio
+            // is anchored at file start). Clamping to byte 0 gets the
+            // demuxer to the file head; the audio decoder's drain then
+            // picks up the first emitted frame, which Rust already
+            // normalises by subtracting `audio_start_time_us`.
+            if time_us <= 0 {
                 // Seek to beginning - use byte position 0
                 let byte_seek_result = unsafe {
                     ffmpeg::ffi::av_seek_frame(
@@ -1266,18 +1280,23 @@ impl FFmpegContext {
             );
         }
 
-        // Clear audio packet queue after seek_precise.
-        // During seek_precise, audio packets are queued while decoding video frames to reach target.
-        // These audio packets may not be synchronized with the final video position.
-        // Clearing the queue ensures that prime_audio_after_seek will read fresh audio packets
-        // starting from the correct position.
-        if !self.audio_packet_queue.is_empty() {
-            log::info!(
-                "FFmpegContext::seek_precise - clearing {} stale audio packets from queue",
-                self.audio_packet_queue.len()
-            );
-            self.audio_packet_queue.clear();
-        }
+        // Keep the audio packets queued during the forward video-decode
+        // walk. They sit at absolute times between the keyframe seek
+        // landing and the target video frame, which for some callers
+        // (CYBFFmpegDecoder's drain-based audio seek) is *exactly* the
+        // range that needs to be drained — discarding them here forces
+        // `prime_audio_after_seek` to re-read from the post-walk input
+        // position, skipping audio that lives before the first video
+        // frame in the file (e.g. broadcast MXF where audio starts at
+        // file head but video starts at the recording timecode origin
+        // several seconds later, so scrub-to-0 lands the demuxer past
+        // the audio's actual head and surfaces as silence). Consumers
+        // that need only audio strictly at-or-after the target run
+        // their own drain on top of the queue.
+        log::debug!(
+            "FFmpegContext::seek_precise - leaving {} queued audio packets for downstream drain",
+            self.audio_packet_queue.len()
+        );
 
         Ok(best_frame)
     }
