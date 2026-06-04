@@ -75,25 +75,21 @@ for l in "${FFMPEG_LIBS[@]}"; do
     echo "  built $DIST/$l.xcframework"
 done
 
-echo "=== Packaging Rust static core (module CybFFmpegC) ==="
-CORE_HDR="$WORK/coreheaders"
-mkdir -p "$CORE_HDR"
-cp "$HEADER_DIR/cyb_ffmpeg.h" "$CORE_HDR/"
-[ -f "$HEADER_DIR/cyb_ffmpeg_generated.h" ] && cp "$HEADER_DIR/cyb_ffmpeg_generated.h" "$CORE_HDR/"
-# modulemap WITHOUT `link "cyb_ffmpeg_core"` — the static lib is supplied by the
-# XCFramework itself, so an explicit -l would double-link / fail to resolve.
-cat > "$CORE_HDR/module.modulemap" <<'EOF'
-module CybFFmpegC {
-    header "cyb_ffmpeg.h"
-    export *
-}
-EOF
+echo "=== Packaging Rust static core (library only, no headers) ==="
+# IMPORTANT: ship the Rust static lib WITHOUT headers/modulemap. The C module
+# `CybFFmpegC` is provided by a *source* systemLibrary target in Package.swift
+# instead. A static-library XCFramework that bundles `Headers/module.modulemap`
+# gets that modulemap copied to the consuming app's shared
+# `$(BUILT_PRODUCTS_DIR)/include/module.modulemap`, which collides with any
+# other static-lib XCFramework that does the same (e.g. kirinuki-ai's
+# KirinukiCore) → "Multiple commands produce …/include/module.modulemap".
+# Keeping the modulemap in source (referenced in place, never copied to
+# include/) avoids the collision.
 cp "$RUST_LIB" "$WORK/libcyb_ffmpeg_core.a"
 xcodebuild -create-xcframework \
     -library "$WORK/libcyb_ffmpeg_core.a" \
-    -headers "$CORE_HDR" \
     -output "$DIST/CybFFmpegCore.xcframework" >/dev/null
-echo "  built $DIST/CybFFmpegCore.xcframework"
+echo "  built $DIST/CybFFmpegCore.xcframework (library only)"
 
 echo "=== Zipping + computing checksums ==="
 printf '\n----- paste into Package.swift (after uploading zips to the Release) -----\n'

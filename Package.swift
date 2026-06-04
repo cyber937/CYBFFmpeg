@@ -26,17 +26,19 @@ import Foundation
 let useLocalBinaries = ProcessInfo.processInfo.environment["CYBFFMPEG_LOCAL"] != nil
 
 // Bump this when publishing a new Release; checksums come from make-xcframeworks.sh.
-let releaseTag = "v1.0.0"
+let releaseTag = "v1.0.1"
 let releaseBase = "https://github.com/cyber937/CYBFFmpeg/releases/download/\(releaseTag)"
 
 // Checksums printed by make-xcframeworks.sh (release mode only).
+// v1.0.1: CybFFmpegCore is now library-only (no bundled modulemap), so all
+// artifacts were re-zipped — checksums differ from v1.0.0.
 let checksums: [String: String] = [
-    "CybFFmpegCore": "e04cca868785fcb1c232730192ddc821db0169f52ee315616df7825d2ea6bce6",
-    "avcodec":       "e9dcef31d22faa4524c4064f4e4e168a6ab41c221d1e19fcc755ffbcf6a675b6",
-    "avformat":      "588255120195debaa39002032077dffcd2a629c106c18fc58232bb3cc7e02e32",
-    "avutil":        "ca8da6221d8623f4371ff2b237b783229357631b29ad64fce695ef93a03a73b6",
-    "swscale":       "f7df31a8c7b255a7d58923c12799b76946e49748c4a7ac79fad30055619ce042",
-    "swresample":    "6b52f0c2e3133669a0cefaca879c446c114607a274ae9a2891c76bbad9fcc783",
+    "CybFFmpegCore": "d062577159fc51db8c77c7236f66dc0d54de11ab18bc019c5b44a37bb0b2adee",
+    "avcodec":       "61b339da25ea970be34c9373982a2661eca9be5e9c9f91b4d7fcfc23aa5ba8df",
+    "avformat":      "5f2dbbe211b4632ce2647495802e65b7ded3e018c9b44b84f27a0bc4d6f8559a",
+    "avutil":        "0c05a9a37df28bad155cfcd17ee8b2b9333002f6413066e987932c1febd2f0a6",
+    "swscale":       "8bb448a0fb4a6a19b9bd546e081badb0b18e1607d6d597fe55adeb3fceaa80d4",
+    "swresample":    "a43581e3aad316e6c283f5102eef77729c19b7c120c032b9c3f65ef92cc54dac",
 ]
 
 func nativeBinary(_ name: String) -> Target {
@@ -61,16 +63,28 @@ let package = Package(
     ],
     targets: [
         // --- Native layer (pre-built binaries) -------------------------------
-        nativeBinary("CybFFmpegCore"),   // Rust static + headers/modulemap (module `CybFFmpegC`)
+        nativeBinary("CybFFmpegCore"),   // Rust static lib ONLY (no headers)
         nativeBinary("avcodec"),         // FFmpeg dynamic libs (LGPL — replaceable)
         nativeBinary("avformat"),
         nativeBinary("avutil"),
         nativeBinary("swscale"),
         nativeBinary("swresample"),
+        // C interop module for the Rust FFI. Kept as a SOURCE systemLibrary
+        // (not bundled in the CybFFmpegCore XCFramework) so its module.modulemap
+        // is referenced in place and never copied to the consuming app's shared
+        // `include/` — which would collide with another static-lib XCFramework's
+        // modulemap (e.g. KirinukiCore) as "Multiple commands produce
+        // include/module.modulemap". The actual symbols come from the
+        // `CybFFmpegCore` binary above.
+        .systemLibrary(
+            name: "CybFFmpegC",
+            path: "Sources/CYBFFmpeg/CybFFmpegC"
+        ),
         // --- Swift layer (source) --------------------------------------------
         .target(
             name: "CYBFFmpeg",
             dependencies: [
+                "CybFFmpegC",
                 "CybFFmpegCore",
                 "avcodec",
                 "avformat",
