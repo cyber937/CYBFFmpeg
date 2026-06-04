@@ -1,5 +1,7 @@
 module CybFFmpegC {
     header "include/cyb_ffmpeg.h"
-    link "cyb_ffmpeg_core"
+    // No `link` directive: libcyb_ffmpeg_core.a is supplied by the
+    // `CybFFmpegCore` binaryTarget (library-only XCFramework) and linked by
+    // SwiftPM via its full path.
     export *
 }
