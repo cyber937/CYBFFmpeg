@@ -26,19 +26,22 @@ import Foundation
 let useLocalBinaries = ProcessInfo.processInfo.environment["CYBFFMPEG_LOCAL"] != nil
 
 // Bump this when publishing a new Release; checksums come from make-xcframeworks.sh.
-let releaseTag = "v1.0.1"
+let releaseTag = "v1.0.2"
 let releaseBase = "https://github.com/cyber937/CYBFFmpeg/releases/download/\(releaseTag)"
 
 // Checksums printed by make-xcframeworks.sh (release mode only).
+// v1.0.2: 音声の無変換コピー（`FFmpegAudioRemuxer`）を足した。Rust の core が
+// 変わったので CybFFmpegCore は当然変わる。**FFmpeg の 5 本は中身を再ビルドして
+// いないが、zip を作り直したのでチェックサムは変わる** —— 6 本すべて上げ直すこと。
 // v1.0.1: CybFFmpegCore is now library-only (no bundled modulemap), so all
 // artifacts were re-zipped — checksums differ from v1.0.0.
 let checksums: [String: String] = [
-    "CybFFmpegCore": "d062577159fc51db8c77c7236f66dc0d54de11ab18bc019c5b44a37bb0b2adee",
-    "avcodec":       "61b339da25ea970be34c9373982a2661eca9be5e9c9f91b4d7fcfc23aa5ba8df",
-    "avformat":      "5f2dbbe211b4632ce2647495802e65b7ded3e018c9b44b84f27a0bc4d6f8559a",
-    "avutil":        "0c05a9a37df28bad155cfcd17ee8b2b9333002f6413066e987932c1febd2f0a6",
-    "swscale":       "8bb448a0fb4a6a19b9bd546e081badb0b18e1607d6d597fe55adeb3fceaa80d4",
-    "swresample":    "a43581e3aad316e6c283f5102eef77729c19b7c120c032b9c3f65ef92cc54dac",
+    "CybFFmpegCore": "e91588eabd4b676dc6c7fe336d4f9a36552c72ee8a91e68d3f4fbd151462ea3e",
+    "avcodec":       "b00bfa014b64e721058cba860b17eaccaded121fb70dd6efabc01e292a10e82e",
+    "avformat":      "86575e75ac194d8a2245e6dae353c2669002abca9cf469ef213bbc60806937ec",
+    "avutil":        "03a36345b5ec5379cbbca58e54ff2c560b10d624acb945a25e2c3ab2575e9a9b",
+    "swscale":       "796901f78f253d08ad79938084893edc87f4346f3d8d653d0fdca9d7c0e547a8",
+    "swresample":    "5de0dbe0b416611d031fbb441d38d9da0461a0e2afdd7528163699429dc595a8",
 ]
 
 func nativeBinary(_ name: String) -> Target {
