@@ -1263,3 +1263,93 @@ mod tests {
         assert!(!version.is_null());
     }
 }
+
+// =============================================================================
+// Audio stream copy (remux) — kirinuki-ai #1765
+// =============================================================================
+
+/// 入力の音声ストリームを**無変換で** `output_path` へ書き出す。
+///
+/// `ffmpeg -vn -c:a copy` と同じ。デコードもエンコードもしない。
+///
+/// 89.5 分の画面収録で実測: 内蔵 SSD **0.64 秒** / 外付け HDD **4.4 秒**。
+/// 同じ素材を `AVAssetReader` で回すと 90 秒 / 114.5 秒かかっていた
+/// （1 サンプルバッファあたり 534 μs × 161,132 個）。
+///
+/// 書いたパケット数を `out_packets` に返す（NULL 可）。0 パケットは失敗として扱う。
+///
+/// 🚨 **コーデック変換はしない。** 入力が目的のコーデックかは
+/// [`cyb_audio_codec_name`] で確かめてから呼ぶこと。
+#[no_mangle]
+pub extern "C" fn cyb_remux_audio(
+    input_path: *const c_char,
+    output_path: *const c_char,
+    out_packets: *mut u64,
+) -> CybResult {
+    let (Some(input), Some(output)) = (cstr_to_path(input_path), cstr_to_path(output_path)) else {
+        set_last_error("Path is null or not valid UTF-8");
+        return CybResult::ErrorInvalidFormat;
+    };
+    match crate::remux::remux_audio(&input, &output) {
+        Ok(stats) => {
+            if !out_packets.is_null() {
+                unsafe { *out_packets = stats.packets };
+            }
+            CybResult::Success
+        }
+        Err(e) => CybResult::from(e),
+    }
+}
+
+/// 入力の音声ストリームのコーデック名（`aac` など）を `buffer` へ書く。
+///
+/// 呼び出し側が「無変換コピーでよいか」を決めるための材料。
+/// 音声が無ければ `ErrorCodecNotSupported`。
+#[no_mangle]
+pub extern "C" fn cyb_audio_codec_name(
+    input_path: *const c_char,
+    buffer: *mut c_char,
+    buffer_len: usize,
+) -> CybResult {
+    let Some(input) = cstr_to_path(input_path) else {
+        set_last_error("Path is null or not valid UTF-8");
+        return CybResult::ErrorInvalidFormat;
+    };
+    if buffer.is_null() || buffer_len == 0 {
+        set_last_error("Buffer is null or zero-length");
+        return CybResult::ErrorMemory;
+    }
+    match crate::remux::audio_codec_name(&input) {
+        Ok(Some(name)) => {
+            let Ok(c) = CString::new(name) else {
+                set_last_error("Codec name contains a NUL byte");
+                return CybResult::ErrorUnknown;
+            };
+            let bytes = c.as_bytes_with_nul();
+            if bytes.len() > buffer_len {
+                set_last_error("Buffer too small for codec name");
+                return CybResult::ErrorMemory;
+            }
+            unsafe {
+                ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, buffer, bytes.len());
+            }
+            CybResult::Success
+        }
+        Ok(None) => {
+            set_last_error("No audio stream");
+            CybResult::ErrorCodecNotSupported
+        }
+        Err(e) => CybResult::from(e),
+    }
+}
+
+/// C 文字列を `PathBuf` にする。NULL / 不正 UTF-8 は `None`。
+fn cstr_to_path(p: *const c_char) -> Option<std::path::PathBuf> {
+    if p.is_null() {
+        return None;
+    }
+    unsafe { CStr::from_ptr(p) }
+        .to_str()
+        .ok()
+        .map(std::path::PathBuf::from)
+}

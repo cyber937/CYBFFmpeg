@@ -37,6 +37,7 @@ pub mod cache;
 pub mod decoder;
 pub mod error;
 pub mod ffi;
+pub mod remux;
 pub mod threading;
 
 // Re-export main types
