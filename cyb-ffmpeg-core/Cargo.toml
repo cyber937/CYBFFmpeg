@@ -10,8 +10,10 @@ readme = "README.md"
 
 [lib]
 name = "cyb_ffmpeg_core"
-# Use staticlib only to avoid dylib loading issues at runtime
-crate-type = ["staticlib"]
+# staticlib は消費者（Swift）向け。dylib にすると実行時のロードで詰まる。
+# rlib は **examples / integration test 用**に足した（2026-09-02）—— これが無いと
+#  がクレートを import できない。出荷物（.a）は変わらない。
+crate-type = ["staticlib", "rlib"]
 
 [features]
 default = ["videotoolbox"]

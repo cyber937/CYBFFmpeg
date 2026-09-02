@@ -422,4 +422,28 @@ enum CybResult cyb_decoder_get_next_audio_frame_summary(struct CybDecoderHandle 
 // Get audio channel count
  uint32_t cyb_decoder_get_audio_channels(const struct CybDecoderHandle *handle) ;
 
+// 入力の音声ストリームを**無変換で** `output_path` へ書き出す。
+//
+// `ffmpeg -vn -c:a copy` と同じ。デコードもエンコードもしない。
+//
+// 89.5 分の画面収録で実測: 内蔵 SSD **0.64 秒** / 外付け HDD **4.4 秒**。
+// 同じ素材を `AVAssetReader` で回すと 90 秒 / 114.5 秒かかっていた
+// （1 サンプルバッファあたり 534 μs × 161,132 個）。
+//
+// 書いたパケット数を `out_packets` に返す（NULL 可）。0 パケットは失敗として扱う。
+//
+// 🚨 **コーデック変換はしない。** 入力が目的のコーデックかは
+// [`cyb_audio_codec_name`] で確かめてから呼ぶこと。
+
+enum CybResult cyb_remux_audio(const char *input_path,
+                               const char *output_path,
+                               uint64_t *out_packets)
+;
+
+// 入力の音声ストリームのコーデック名（`aac` など）を `buffer` へ書く。
+//
+// 呼び出し側が「無変換コピーでよいか」を決めるための材料。
+// 音声が無ければ `ErrorCodecNotSupported`。
+ enum CybResult cyb_audio_codec_name(const char *input_path, char *buffer, uintptr_t buffer_len) ;
+
 #endif /* CYB_FFMPEG_H */
